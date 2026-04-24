@@ -1,0 +1,67 @@
+
+# 8 UWB anchors positioned in a room (positions in meters, anchor frame)
+anchors:
+  - [-2.4175, -4.0208, 0.1818]   # anchor 0
+  - [-2.8205, 3.5250, 2.5874]    # anchor 1
+  - [3.4819, 3.3050, 0.1545]     # anchor 2
+  - [3.4507, -3.7181, 2.6693]    # anchor 3
+  - [-3.2776, -3.8690, 2.6739]   # anchor 4
+  - [3.2655, -3.6511, 0.1752]    # anchor 5
+  - [3.8321, 3.6521, 2.6249]     # anchor 6
+  - [-2.7228, 3.2191, 0.1583]    # anchor 7
+
+anchor_extrinsic_translation: [-0.03,-0.05,-0.15]    # [x, y, z]
+
+# --- IMU noise parameters ---
+# IMU runs at ~1008 Hz, accel in g-units, gyro in deg/s.
+# NOTE: gravity is pre-subtracted upstream, so pitch/roll are NOT observable
+# from the IMU factor. We deliberately inflate accel/gyro noise below so that
+# TDOA + altitude priors dominate, and the IMU factor only acts as a local
+# smoothing term. Do not tighten these without a proper attitude source.
+accel_noise_sigma: 0.05         # was 0.0005 — inflated: IMU is dead-reckoning
+gyro_noise_sigma: 0.01          # was 0.0005 — inflated: attitude unobservable
+accel_bias_rw_sigma: 0.01  
+gyro_bias_rw_sigma: 0.00002     # tight: keeps bias near zero
+integration_noise_sigma: 1e-2   # was 1e-3 — looser to match the above
+
+
+# --- TDOA noise ---
+# Observed TDOA residual RMS ~2.0 m, so 0.5 m was too optimistic and pushed
+# Huber into aggressive down-weighting. 1.0 m matches observed noise better.
+tdoa_noise_sigma: 1.0
+
+# --- Cycle detection ---
+num_anchors: 8
+measurements_per_cycle: 8
+min_cycle_measurements: 6       # accept short cycles (UWB drops 1-2 msgs)
+min_imu_per_cycle: 2
+cycle_timeout: 0.1
+
+# --- Prior sigmas [rot_x, rot_y, rot_z, tx, ty, tz] ---
+       # was 0.001 — now bias can move away from zero
+  # was 0.0004 — graph can find true ~0.47 bias
+# --- Robust noise ---
+# Huber kernel on the TDOA factor — down-weights outlier anchor pairs once
+# the solution is tracking.
+use_robust_noise: true
+huber_k: 1.345
+
+# --- Initial state ---
+# Initial pose seed for the factor graph, assigned directly from this file.
+# initial_orientation is a quaternion [qx, qy, qz, qw]; identity by default.
+initial_position: [1.27600002288818,0.021999999880791,0.08500000089407]
+initial_orientation: [-0.002767541212961, -0.006918853148818, 0.015221476554871, 0.999856352806091]
+
+# --- Z-axis constraint ---
+# Anchors span Z=0.15-2.67m (weak vertical TDOA geometry) which is the main
+# reason Z diverges. NOTE: these keys are NOT yet consumed by
+# uwb_imu_fusion_node.cpp — wiring them into the factor graph is still TODO.
+use_altitude_constraint: true
+altitude_z_ref: 1.5       
+altitude_sigma: 0.5
+zero_vel_sigma: 0.05         # was 0.3 — now actually dominates ImuFactor
+
+
+# --- Misc ---
+max_path_poses: 5000
+log_residuals: true
