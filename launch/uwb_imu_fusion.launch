@@ -1,63 +1,199 @@
 <launch>
+
+    <!-- ============================================================ -->
+    <!-- uwb_imu_fusion — TC FGO                                     -->
+    <!-- ============================================================ -->
+
     <!-- Topic remapping -->
-    <arg name="imu_topic" default="/imu_data" />
+    <arg name="imu_topic" default="/imu_data"  />
     <arg name="uwb_topic" default="/tdoa_data" />
-    <arg name="gt_topic" default="/pose_data" />
-    <arg name="enable_viz" default="true" />
+    <arg name="gt_topic"  default="/pose_data" />
+
+    <!-- Visualization -->
+    <arg name="enable_viz"  default="true" />
     <arg name="enable_rviz" default="true" />
-    <arg name="gravity_magnitude" default="0.0" />
 
-    # --- Frame IDs ---
-    <arg name="odom_frame" default="map" />
+    <!-- Frame IDs -->
+    <arg name="odom_frame" default="map"       />
     <arg name="base_frame" default="base_link" />
-    <arg name="residual_log_path" default="$(find uwb_imu_fusion)/output/uwb_imu_residuals.csv" />
 
-    <arg name="pose_prior_sigma" default="0.05" />
-    <arg name="vel_prior_sigma" default="0.5" />
-    <arg name="bias_prior_sigma" default="0.3" />
+    <!-- Log path -->
+    <arg name="trajectory_log_path"
+         default="$(find uwb_imu_fusion)/output/uwb_imu_trajectory_tc.csv" />
+    <arg name="imu_log_path"
+         default="$(find uwb_imu_fusion)/output/uwb_imu_raw_imu.csv" />
 
-    <!-- IMU -->
-    <arg name="imu_acc_noise" default="0.1" />
-    <arg name="imu_gyro_noise" default="0.01" />
-    <arg name="imu_acc_bias_noise" default="0.01" />
-    <arg name="imu_gyro_bias_noise" default="0.001" />
-    <arg name="tdoa_sigma" default="0.5" />
-    <arg name="initial_acc_bias_x" default="0.0" />
-    <arg name="initial_acc_bias_y" default="0.0" />
-    <arg name="initial_acc_bias_z" default="0.0" />
-    <arg name="initial_gyro_bias_x" default="0.0" />
-    <arg name="initial_gyro_bias_y" default="0.0" />
-    <arg name="initial_gyro_bias_z" default="0.0" />
+    <!-- ==================================================================== -->
+    <!-- IMU PHYSICS                                                           -->
+    <!--                                                                       -->
+    <!-- imu_accel_in_g: true  = sensor publishes in g                        -->
+    <!--                          node converts to m/s² via accel_scale =     -->
+    <!--                          gravity_magnitude (load order guaranteed)    -->
+    <!--                                                                       -->
+    <!-- gyro_is_degrees: TRUE — confirmed from log data.                      -->
+    <!--   Raw gyro norm reached 130 during motion.  As rad/s that would be   -->
+    <!--   7.5 rev/s — physically impossible.  As deg/s = 2.3 rad/s = a fast  -->
+    <!--   tilt, consistent with observed UWB trajectory.                      -->
+    <!--   Without this flag the gyro is fed 57.3x too large to GTSAM →       -->
+    <!--   orientation diverges in ~2 s → position error reaches 43 m.        -->
+    <!-- ==================================================================== -->
+    <arg name="gravity_magnitude" default="9.80665" />
+    <arg name="imu_accel_in_g"    default="true" />
+    <arg name="gyro_is_degrees"   default="true" />   <!-- PRIMARY FIX: was false -->
+    <arg name="estimate_initial_orientation_from_imu" default="true" />
+    <arg name="initial_alignment_imu_samples" default="100" />
 
-    <!-- Load config -->
-    <rosparam file="$(find uwb_imu_fusion)/config/anchors.yaml" command="load" ns="uwb_imu_fusion" />
+    <!-- ==================================================================== -->
+    <!-- TC IMU NOISE — data-measured from static-period analysis             -->
+    <!--                                                                       -->
+    <!--   Measured accel noise std (static):   ~0.04 m/s² per axis           -->
+    <!--   Measured gyro  noise std (static):   ~0.0025 rad/s per axis        -->
+    <!--   Measured accel bias (static mean):   ax=+0.22, ay=+0.07 m/s²      -->
+    <!--   Measured gyro  bias (static mean):   ~0.001 rad/s (near-zero)      -->
+    <!--                                                                       -->
+    <!-- tc_integration_noise_sigma raised to 1e-4:                           -->
+    <!--   IMU rate is ~974 Hz.  At 1e-5 the integration covariance per step  -->
+    <!--   (1e-5)^2 = 1e-10 m²/step × N_steps accumulates negligibly; 1e-4   -->
+    <!--   gives a small but non-trivial floor that prevents numerical         -->
+    <!--   ill-conditioning over long (>500 step) integration windows.        -->
+    <!-- ==================================================================== -->
+    <arg name="tc_accel_noise_sigma"       default="0.04"   />
+    <arg name="tc_gyro_noise_sigma"        default="0.003"  />
+    <arg name="tc_accel_bias_rw_sigma"     default="0.01"   />
+    <arg name="tc_gyro_bias_rw_sigma"      default="0.0003" />
+    <arg name="tc_integration_noise_sigma" default="1e-4"   />
 
-    <node pkg="uwb_imu_fusion" type="uwb_imu_fusion_node" name="uwb_imu_fusion_node" output="screen">
-        <param name="imu" value="$(arg imu_topic)" />
-        <param name="uwb" value="$(arg uwb_topic)" />
-        <param name="gt" value="$(arg gt_topic)" />
+    <!-- ==================================================================== -->
+    <!-- TC PRIORS                                                             -->
+    <!--                                                                       -->
+    <!-- tc_prior_bias_sigma:                                                  -->
+    <!--   FIX: was 0.001 — pinned bias to zero for the entire run.           -->
+    <!--   Real MEMS accel biases are 0.05 to 0.3 m/s2.                       -->
+    <!--   Set to 0.1 m/s2 so first-cycle TDOA residuals can correct bias.    -->
+    <!--                                                                       -->
+    <!-- tc_update_vel_sigma:                                                  -->
+    <!--   FIX: was 2.0 m/s — too loose. Velocity drifts 2 m/s from the IMU  -->
+    <!--   prediction between cycles, causing runaway TC errors. Use 0.5 m/s. -->
+    <!-- ==================================================================== -->
+    <arg name="tc_prior_vel_sigma"   default="0.1"  />
+    <arg name="tc_prior_bias_sigma"  default="0.1"  />
+    <arg name="tc_update_vel_sigma"  default="0.5"  />
+    <arg name="tc_update_bias_sigma" default="0.1"  />
+    <arg name="tc_use_vertical_prior"     default="true" />
+    <arg name="tc_vertical_prior_sigma"   default="0.2"  />
+
+    <!-- ==================================================================== -->
+    <!-- WLS POSITION PRIOR (TC graph)                                        -->
+    <!--                                                                       -->
+    <!-- tc_wls_xy_sigma = 0.25 m: confident in WLS horizontal accuracy       -->
+    <!-- tc_wls_z_sigma  = 0.35 m: looser — WLS Z is weaker due to poor       -->
+    <!--   vertical anchor geometry; locking Z too tightly cascades into       -->
+    <!--   XY errors (TC Z drifted to -0.034 m when GT was 0.085 m).          -->
+    <!-- ==================================================================== -->
+    <arg name="tc_use_wls_position_prior" default="true" />
+    <arg name="tc_wls_xy_sigma"           default="0.25" />
+    <arg name="tc_wls_z_sigma"            default="0.35" />
+    <!-- IMU dropout fallback — applied when imu_n < min_imu_per_cycle      -->
+    <!-- tc_wls_dropout_xy_sigma: softer WLS prior (no IMU = less orientation confidence) -->
+    <!-- tc_dropout_vel_sigma: tight velocity prior to prevent phantom drift during gap     -->
+    <!-- wls_innovation_gate: reject WLS prior if WLS is >N m from current TC XY estimate  -->
+    <!--   Data: 100% of dropout cycles had valid WLS. Gate prevents destabilisation        -->
+    <!--   when TC has already drifted (e.g. from a preceding gap).                         -->
+    <arg name="tc_wls_dropout_xy_sigma"   default="0.40" />
+    <arg name="tc_dropout_vel_sigma"      default="0.1"  />
+    <arg name="wls_innovation_gate"       default="0.8"  />
+
+    <rosparam param="/uwb_imu_fusion/tc_prior_pose_sigmas"
+              >[ 0.5, 0.5, 0.5, 0.05, 0.05, 0.02 ]</rosparam>
+
+    <!-- ==================================================================== -->
+    <!-- UWB NOISE                                                             -->
+    <!--                                                                       -->
+    <!-- tdoa_sigma = 0.3 m is the balanced operating point:                  -->
+    <!--   0.15 m (too tight): any multipath/NLOS spike yanks the trajectory  -->
+    <!--     hard — this caused the large error jumps seen in the logs.        -->
+    <!--   0.5  m (too loose): TDOA barely constrains position; IMU drifts.   -->
+    <!--   0.3  m + Huber kernel: nominal measurements get full weight;        -->
+    <!--     outliers beyond huber_k x tdoa_sigma are auto-downweighted.       -->
+    <!-- ==================================================================== -->
+    <arg name="tdoa_sigma"       default="0.3"   />
+    <arg name="use_robust_noise" default="true"  />
+    <arg name="huber_k"          default="1.345" />
+
+    <!-- Anchor positions — edit to match your room -->
+    <rosparam file="$(find uwb_imu_fusion)/config/anchors.yaml"
+              command="load" ns="uwb_imu_fusion" />
+
+    <!-- ============================================================ -->
+    <!-- Fusion node                                                   -->
+    <!-- ============================================================ -->
+    <node pkg="uwb_imu_fusion"
+          type="uwb_imu_fusion_node"
+          name="uwb_imu_fusion_node"
+          output="screen">
+
+        <!-- Topic names -->
+        <param name="imu_topic" value="$(arg imu_topic)" />
+        <param name="uwb_topic" value="$(arg uwb_topic)" />
+        <param name="gt_topic"  value="$(arg gt_topic)"  />
+
+        <!-- Frames -->
         <param name="odom_frame" value="$(arg odom_frame)" />
         <param name="base_frame" value="$(arg base_frame)" />
-        <param name="residual_log_path" value="$(arg residual_log_path)" />
-        <param name="pose_prior_sigma" value="$(arg pose_prior_sigma)" />
-        <param name="vel_prior_sigma" value="$(arg vel_prior_sigma)" />
-        <param name="bias_prior_sigma" value="$(arg bias_prior_sigma)" />
-        <param name="imu_acc_noise" value="$(arg imu_acc_noise)" />
-        <param name="imu_gyro_noise" value="$(arg imu_gyro_noise)" />
-        <param name="imu_acc_bias_noise" value="$(arg imu_acc_bias_noise)" />
-        <param name="imu_gyro_bias_noise" value="$(arg imu_gyro_bias_noise)" />
-        <param name="initial_acc_bias_x" value="$(arg initial_acc_bias_x)" />
-        <param name="initial_acc_bias_y" value="$(arg initial_acc_bias_y)" />
-        <param name="initial_acc_bias_z" value="$(arg initial_acc_bias_z)" />
-        <param name="initial_gyro_bias_x" value="$(arg initial_gyro_bias_x)" />
-        <param name="initial_gyro_bias_y" value="$(arg initial_gyro_bias_y)" />
-        <param name="initial_gyro_bias_z" value="$(arg initial_gyro_bias_z)" />
+
+        <!-- Log -->
+        <param name="trajectory_log_path" value="$(arg trajectory_log_path)" />
+        <param name="imu_log_path"         value="$(arg imu_log_path)"         />
+
+        <!-- IMU physics -->
+        <param name="gravity_magnitude" value="$(arg gravity_magnitude)" />
+        <param name="imu_accel_in_g"    value="$(arg imu_accel_in_g)" />
+        <param name="gyro_is_degrees"   value="$(arg gyro_is_degrees)" />
+        <param name="estimate_initial_orientation_from_imu"
+               value="$(arg estimate_initial_orientation_from_imu)" />
+        <param name="initial_alignment_imu_samples"
+               value="$(arg initial_alignment_imu_samples)" />
+
+        <!-- TC IMU noise -->
+        <param name="tc_accel_noise_sigma"       value="$(arg tc_accel_noise_sigma)"       />
+        <param name="tc_gyro_noise_sigma"        value="$(arg tc_gyro_noise_sigma)"        />
+        <param name="tc_accel_bias_rw_sigma"     value="$(arg tc_accel_bias_rw_sigma)"     />
+        <param name="tc_gyro_bias_rw_sigma"      value="$(arg tc_gyro_bias_rw_sigma)"      />
+        <param name="tc_integration_noise_sigma" value="$(arg tc_integration_noise_sigma)" />
+
+        <!-- TC priors -->
+        <param name="tc_prior_vel_sigma"          value="$(arg tc_prior_vel_sigma)"          />
+        <param name="tc_prior_bias_sigma"         value="$(arg tc_prior_bias_sigma)"         />
+        <param name="tc_update_vel_sigma"         value="$(arg tc_update_vel_sigma)"         />
+        <param name="tc_update_bias_sigma"        value="$(arg tc_update_bias_sigma)"        />
+        <param name="tc_use_vertical_prior"       value="$(arg tc_use_vertical_prior)"       />
+        <param name="tc_vertical_prior_sigma"     value="$(arg tc_vertical_prior_sigma)"     />
+        <param name="tc_use_wls_position_prior"   value="$(arg tc_use_wls_position_prior)"   />
+        <param name="tc_wls_xy_sigma"             value="$(arg tc_wls_xy_sigma)"             />
+        <param name="tc_wls_z_sigma"              value="$(arg tc_wls_z_sigma)"              />
+        <param name="tc_wls_dropout_xy_sigma"     value="$(arg tc_wls_dropout_xy_sigma)"     />
+        <param name="tc_dropout_vel_sigma"        value="$(arg tc_dropout_vel_sigma)"        />
+        <param name="wls_innovation_gate"         value="$(arg wls_innovation_gate)"         />
+
+        <!-- UWB -->
+        <param name="tdoa_sigma"       value="$(arg tdoa_sigma)"       />
+        <param name="use_robust_noise" value="$(arg use_robust_noise)" />
+        <param name="huber_k"          value="$(arg huber_k)"          />
+
     </node>
 
-    <!--  visualization  -->
-    <node if="$(arg enable_viz)" pkg="uwb_imu_fusion" type="uwb_imu_fusion_viz_node" name="uwb_imu_fusion_viz_node" output="screen">
-    </node>
+    <!-- ============================================================ -->
+    <!-- Visualization (optional)                                     -->
+    <!-- ============================================================ -->
+    <node if="$(arg enable_viz)"
+          pkg="uwb_imu_fusion"
+          type="uwb_imu_fusion_viz_node"
+          name="uwb_imu_fusion_viz_node"
+          output="screen" />
 
-    <!-- RViz  -->
-    <node if="$(arg enable_rviz)" type="rviz" pkg="rviz" name="rviz" args="-d $(find uwb_imu_fusion)/config/viz.rviz" />
+    <!-- RViz (optional) -->
+    <node if="$(arg enable_rviz)"
+          type="rviz" pkg="rviz" name="rviz"
+          args="-d $(find uwb_imu_fusion)/config/viz.rviz" />
+
 </launch>

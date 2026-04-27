@@ -12,6 +12,7 @@ Panels:
         - /Path2
         - /Path3
         - /Path4
+        - /Path5
       Splitter Ratio: 0.5
     Tree Height: 719
   - Class: rviz/Selection
@@ -175,7 +176,7 @@ Visualization Manager:
     - Alpha: 1
       Buffer Length: 1
       Class: rviz/Path
-      Color: 239; 41; 41
+      Color: 114; 159; 207
       Enabled: true
       Head Diameter: 0.30000001192092896
       Head Length: 0.20000000298023224
@@ -193,7 +194,7 @@ Visualization Manager:
       Radius: 0.029999999329447746
       Shaft Diameter: 0.10000000149011612
       Shaft Length: 0.10000000149011612
-      Topic: /uwb_imu_fusion_path
+      Topic: /tc_fusion_path
       Unreliable: false
       Value: true
   Enabled: true

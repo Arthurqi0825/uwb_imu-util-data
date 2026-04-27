@@ -44,24 +44,31 @@ include_directories(
 add_executable(uwb_imu_fusion_node
   src/uwb_imu_fusion_node.cpp
 )
-
-add_executable(uwb_imu_fusion_viz_node
-  src/uwb_imu_fusion_viz_node.cpp
-)
-
 add_dependencies(uwb_imu_fusion_node
   ${catkin_EXPORTED_TARGETS}
 )
-
-add_dependencies(uwb_imu_fusion_viz_node
-  ${catkin_EXPORTED_TARGETS}
-)
-
 target_link_libraries(uwb_imu_fusion_node
   ${catkin_LIBRARIES}
   gtsam
 )
 
+add_executable(uwb_imu_fusion_viz_node
+  src/uwb_imu_fusion_viz_node.cpp
+)
+add_dependencies(uwb_imu_fusion_viz_node
+  ${catkin_EXPORTED_TARGETS}
+)
 target_link_libraries(uwb_imu_fusion_viz_node
   ${catkin_LIBRARIES}
+)
+
+add_executable(uwb_imu_lc_wls_fusion_node
+  src/uwb_imu_lc_wls_fusion_node.cpp
+)
+add_dependencies(uwb_imu_lc_wls_fusion_node
+  ${catkin_EXPORTED_TARGETS}
+)
+target_link_libraries(uwb_imu_lc_wls_fusion_node
+  ${catkin_LIBRARIES}
+  gtsam
 )

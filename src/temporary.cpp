@@ -42,61 +42,6 @@ using gtsam::symbol_shorthand::X;
 
 namespace uwb_imu_fusion
 {
-
-  // ============================================================================
-  // ZeroVelocityFactor — soft 3-D prior pulling V(k) toward zero
-  // sigma = zero_vel_sigma (tune to max expected drone speed)
-  // Key role: prevents uncorrected IMU bias from freely integrating into velocity
-  // ============================================================================
-  class ZeroVelocityFactor : public gtsam::NoiseModelFactor1<gtsam::Vector3>
-  {
-  public:
-    ZeroVelocityFactor(gtsam::Key key, const gtsam::SharedNoiseModel &model)
-        : gtsam::NoiseModelFactor1<gtsam::Vector3>(model, key) {}
-
-    gtsam::Vector evaluateError(
-        const gtsam::Vector3 &v,
-        boost::optional<gtsam::Matrix &> H = boost::none) const override
-    {
-      if (H)
-        *H = gtsam::Matrix33::Identity();
-      return v;
-    }
-    gtsam::NonlinearFactor::shared_ptr clone() const override
-    {
-      return boost::make_shared<ZeroVelocityFactor>(*this);
-    }
-  };
-
-  // ============================================================================
-  // AltitudeFactor — pulls translation-Z of Pose3 toward z_ref
-  // Compensates for weak vertical TDOA geometry (anchors span only ~2.5 m Z)
-  // ============================================================================
-  class AltitudeFactor : public gtsam::NoiseModelFactor1<gtsam::Pose3>
-  {
-    double z_ref_;
-
-  public:
-    AltitudeFactor(gtsam::Key key, double z_ref,
-                   const gtsam::SharedNoiseModel &model)
-        : gtsam::NoiseModelFactor1<gtsam::Pose3>(model, key), z_ref_(z_ref) {}
-
-    gtsam::Vector evaluateError(
-        const gtsam::Pose3 &p,
-        boost::optional<gtsam::Matrix &> H = boost::none) const override
-    {
-      gtsam::Matrix36 Ht;
-      gtsam::Point3 t = p.translation(H ? &Ht : nullptr);
-      if (H)
-        *H = Ht.row(2);
-      return (gtsam::Vector(1) << t.z() - z_ref_).finished();
-    }
-    gtsam::NonlinearFactor::shared_ptr clone() const override
-    {
-      return boost::make_shared<AltitudeFactor>(*this);
-    }
-  };
-
   // ============================================================================
   struct ImuMeas
   {
@@ -263,8 +208,7 @@ namespace uwb_imu_fusion
     gtsam::Point3 gt_pos_{gtsam::Point3::Zero()};
 
   public:
-    UwbImuFusionNode(ros::NodeHandle &nh, ros::NodeHandle &pnh)
-        : nh_(nh), pnh_(pnh)
+    UwbImuFusionNode()
     {
       loadParams();
       loadingAnchors();

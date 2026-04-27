@@ -1,0 +1,118 @@
+<launch>
+
+    <!-- ============================================================ -->
+    <!-- uwb_imu_fusion — LC FGO + WLS                               -->
+    <!-- ============================================================ -->
+
+    <!-- Topic remapping -->
+    <arg name="imu_topic" default="/imu_data"  />
+    <arg name="uwb_topic" default="/tdoa_data" />
+    <arg name="gt_topic"  default="/pose_data" />
+
+    <!-- Visualization -->
+    <arg name="enable_viz"  default="true" />
+    <arg name="enable_rviz" default="true" />
+
+    <!-- Frame IDs -->
+    <arg name="odom_frame" default="map"       />
+    <arg name="base_frame" default="base_link" />
+
+    <!-- Log path -->
+    <arg name="trajectory_log_path"
+         default="$(find uwb_imu_fusion)/output/uwb_imu_trajectory_lc.csv" />
+
+    <!-- IMU physics -->
+    <!-- Real IMU publishes acceleration in g. The node converts to m/s^2. -->
+    <arg name="gravity_magnitude" default="9.80665" />
+    <arg name="imu_accel_in_g"    default="true" />
+
+    <!-- IMU noise — HIGH-ACCURACY IMU values                         -->
+    <!-- Weight = 1/sigma²  →  smaller sigma = IMU trusted more       -->
+    <!--                                                               -->
+    <!-- accel_noise_sigma:   raw accel noise [m/s²]                  -->
+    <!--   MEMS: 0.02-0.1    High-accuracy: 0.001-0.005               -->
+    <!-- gyro_noise_sigma:    raw gyro noise [rad/s]                   -->
+    <!--   MEMS: 0.005-0.02  High-accuracy: 0.0001-0.001              -->
+    <!-- accel_bias_rw_sigma: accel bias drift [m/s²/√s]              -->
+    <!--   Loose: 0.01       Stable IMU: 0.0001-0.0005                -->
+    <!-- gyro_bias_rw_sigma:  gyro bias drift [rad/s/√s]              -->
+    <!--   Loose: 0.001      Stable IMU: 0.00001-0.0001               -->
+    <arg name="accel_noise_sigma"       default="0.001"   />
+    <arg name="gyro_noise_sigma"        default="0.0001"  />
+    <arg name="accel_bias_rw_sigma"     default="0.0001"  />
+    <arg name="gyro_bias_rw_sigma"      default="0.00001" />
+    <arg name="integration_noise_sigma" default="1e-6"    />
+
+    <!-- Bias prior — tight for stable high-accuracy IMU              -->
+    <!-- Loose (MEMS): 0.3   Tight (stable): 0.01                    -->
+    <arg name="prior_bias_sigma" default="0.01" />
+    <arg name="prior_vel_sigma"  default="0.1"  />
+
+    <!-- UWB noise -->
+    <!-- wls_position_sigma: WLS position noise fed to LC branch [m]  -->
+    <arg name="wls_position_sigma" default="0.0015" />
+
+    <!-- FGO prior on pose (rotation sigma, translation sigma)        -->
+    <!-- [rot_x, rot_y, rot_z, tx, ty, tz]                           -->
+    <rosparam param="/uwb_imu_fusion/prior_pose_sigmas"
+              >[ 0.05, 0.05, 0.05, 0.01, 0.01, 0.01 ]</rosparam>
+
+    <!-- Anchor positions — edit to match your room -->
+    <rosparam file="$(find uwb_imu_fusion)/config/anchors.yaml"
+              command="load" ns="uwb_imu_fusion" />
+
+    <!-- ============================================================ -->
+    <!-- Fusion node                                                   -->
+    <!-- ============================================================ -->
+    <node pkg="uwb_imu_fusion"
+          type="uwb_imu_lc_wls_fusion_node"
+          name="uwb_imu_lc_wls_fusion_node"
+          output="screen">
+
+        <!-- Topic names (note: code reads imu_topic / uwb_topic / gt_topic) -->
+        <param name="imu_topic" value="$(arg imu_topic)" />
+        <param name="uwb_topic" value="$(arg uwb_topic)" />
+        <param name="gt_topic"  value="$(arg gt_topic)"  />
+
+        <!-- Frames -->
+        <param name="odom_frame" value="$(arg odom_frame)" />
+        <param name="base_frame" value="$(arg base_frame)" />
+
+        <!-- Log -->
+        <param name="trajectory_log_path" value="$(arg trajectory_log_path)" />
+
+        <!-- IMU physics -->
+        <param name="gravity_magnitude" value="$(arg gravity_magnitude)" />
+        <param name="imu_accel_in_g"    value="$(arg imu_accel_in_g)" />
+
+        <!-- IMU noise (high-accuracy values) -->
+        <param name="accel_noise_sigma"       value="$(arg accel_noise_sigma)"       />
+        <param name="gyro_noise_sigma"        value="$(arg gyro_noise_sigma)"        />
+        <param name="accel_bias_rw_sigma"     value="$(arg accel_bias_rw_sigma)"     />
+        <param name="gyro_bias_rw_sigma"      value="$(arg gyro_bias_rw_sigma)"      />
+        <param name="integration_noise_sigma" value="$(arg integration_noise_sigma)" />
+
+        <!-- Priors -->
+        <param name="prior_vel_sigma"  value="$(arg prior_vel_sigma)"  />
+        <param name="prior_bias_sigma" value="$(arg prior_bias_sigma)" />
+
+        <!-- UWB -->
+        <param name="wls_position_sigma"  value="$(arg wls_position_sigma)"  />
+
+    </node>
+
+    <!-- ============================================================ -->
+    <!-- Visualization (optional)                                     -->
+    <!-- ============================================================ -->
+    <node if="$(arg enable_viz)"
+          pkg="uwb_imu_fusion"
+          type="uwb_imu_fusion_viz_node"
+          name="uwb_imu_fusion_viz_node"
+          output="screen" />
+
+    <!-- RViz (optional) -->
+    <node if="$(arg enable_rviz)"
+          type="rviz" pkg="rviz" name="rviz"
+          args="-d $(find uwb_imu_fusion)/config/viz.rviz" />
+
+</launch>
