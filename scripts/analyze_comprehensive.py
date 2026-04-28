@@ -117,6 +117,42 @@ def analyze_trajectory(df: pd.DataFrame, kind: str, title: str, save_path):
         fig.savefig(save_path, dpi=120)
         print(f'[saved] {save_path}')
 
+    # ---- new figure: difference between WLS and fused estimate ----
+    dx = df[f'{fused}_x'] - df['wls_x']
+    dy = df[f'{fused}_y'] - df['wls_y']
+    dz = df[f'{fused}_z'] - df['wls_z']
+    dnorm = np.sqrt(dx ** 2 + dy ** 2 + dz ** 2)
+
+    print('\n=== WLS vs fused difference (m) ===')
+    print(pd.DataFrame({f'{fused_label} - WLS': err_stats(dnorm)}).T[
+        ['mean', 'median', 'rmse', 'std', 'max', 'p95']
+    ].to_string(float_format=lambda v: f'{v:0.4f}'))
+
+    fig2, axes = plt.subplots(2, 2, figsize=(13, 8))
+    fig2.suptitle(f'WLS vs {fused_label} difference — {title}', fontsize=12)
+
+    for ax, data, color, lbl in [
+        (axes[0, 0], dx, 'r', 'Δx'),
+        (axes[0, 1], dy, 'g', 'Δy'),
+        (axes[1, 0], dz, 'b', 'Δz'),
+    ]:
+        ax.plot(t, data, color=color, alpha=0.85, label=lbl)
+        ax.axhline(0, color='k', lw=0.5)
+        ax.set_title(f'{lbl} (fused − WLS)')
+        ax.set_xlabel('t (s)'); ax.set_ylabel(f'{lbl} (m)')
+        ax.grid(True); ax.legend()
+
+    axes[1, 1].plot(t, dnorm, 'm', alpha=0.9, label='|fused − WLS|')
+    axes[1, 1].set_title('Norm of difference')
+    axes[1, 1].set_xlabel('t (s)'); axes[1, 1].set_ylabel('|Δ| (m)')
+    axes[1, 1].grid(True); axes[1, 1].legend()
+
+    fig2.tight_layout(rect=[0, 0, 1, 0.95])
+    if save_path:
+        diff_path = save_path.replace('_analysis.png', '_wls_vs_fused.png')
+        fig2.savefig(diff_path, dpi=120)
+        print(f'[saved] {diff_path}')
+
 
 # --------------------------------- main ------------------------------------
 
