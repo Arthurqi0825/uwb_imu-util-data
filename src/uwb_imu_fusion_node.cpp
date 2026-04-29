@@ -316,6 +316,22 @@ namespace uwb_imu_fusion
       get("tc_use_wls_position_prior", tc_use_wls_position_prior_, true);
       get("tc_wls_xy_sigma", tc_wls_xy_sigma_, 0.25); // balanced: was 0.15 (too tight → NLOS jumps)
       get("tc_wls_z_sigma", tc_wls_z_sigma_, 0.35);   // looser Z: WLS Z less reliable
+      get("tc_wls_rescue_gate", tc_wls_rescue_gate_, 0.25);
+      get("tc_wls_rescue_xy_sigma", tc_wls_rescue_xy_sigma_, 0.08);
+      get("tc_wls_rescue_z_sigma", tc_wls_rescue_z_sigma_, 0.25);
+
+      // ---------------------------------------------------------------------------
+      // TC attitude stabilization
+      //
+      // TDOA is translation-only, so roll/pitch can become weakly observable in the
+      // graph.  When roll/pitch tilt incorrectly, gravity leaks into horizontal
+      // acceleration and creates large velocity errors.  The attitude prior keeps
+      // roll/pitch near the leveled initial attitude while leaving yaw effectively
+      // free, since yaw is not observable from UWB TDOA alone.
+      // ---------------------------------------------------------------------------
+      get("tc_use_attitude_prior", tc_use_attitude_prior_, true);
+      get("tc_attitude_roll_pitch_sigma", tc_attitude_roll_pitch_sigma_, 0.05);
+      get("tc_attitude_yaw_sigma", tc_attitude_yaw_sigma_, 1e6);
 
       // ---------------------------------------------------------------------------
       // IMU dropout handling
@@ -903,23 +919,49 @@ namespace uwb_imu_fusion
                      gtsam::noiseModel::Diagonal::Sigmas(sig));
     }
 
+    void addTcAttitudePrior(gtsam::NonlinearFactorGraph &graph,
+                            size_t k,
+                            const gtsam::Point3 &pos_hint)
+    {
+      if (!tc_use_attitude_prior_)
+        return;
+
+      // Rotation is constrained to the leveled startup attitude.  Translation is
+      // unconstrained here; position is handled by TDOA, WLS, and vertical priors.
+      gtsam::Vector6 sig;
+      sig << tc_attitude_roll_pitch_sigma_,
+          tc_attitude_roll_pitch_sigma_,
+          tc_attitude_yaw_sigma_,
+          1e6, 1e6, 1e6;
+      graph.addPrior(X(k),
+                     gtsam::Pose3(initial_pose_.rotation(), pos_hint),
+                     gtsam::noiseModel::Diagonal::Sigmas(sig));
+    }
+
     void addTcWlsPositionPrior(gtsam::NonlinearFactorGraph &graph,
                                size_t k,
-                               const Eigen::Vector3d &wls_p)
+                               const Eigen::Vector3d &wls_p,
+                               double xy_sigma,
+                               double z_sigma)
     {
       if (!tc_use_wls_position_prior_)
         return;
-      // Rotation components are unconstrained (1e6 = free).
-      // Translation components use balanced WLS sigmas:
-      //   tc_wls_xy_sigma_ (0.25 m): confident in WLS XY
-      //   tc_wls_z_sigma_  (0.35 m): looser Z — WLS vertical is less reliable
+      // Rotation components are unconstrained here.  Roll/pitch are handled by
+      // addTcAttitudePrior(), while translation uses the requested WLS sigmas.
       gtsam::Vector6 sig;
       sig << 1e6, 1e6, 1e6,
-          tc_wls_xy_sigma_, tc_wls_xy_sigma_, tc_wls_z_sigma_;
+          xy_sigma, xy_sigma, z_sigma;
       graph.addPrior(X(k),
                      gtsam::Pose3(gtsam::Rot3::identity(),
                                   gtsam::Point3(wls_p.x(), wls_p.y(), wls_p.z())),
                      gtsam::noiseModel::Diagonal::Sigmas(sig));
+    }
+
+    void addTcWlsPositionPrior(gtsam::NonlinearFactorGraph &graph,
+                               size_t k,
+                               const Eigen::Vector3d &wls_p)
+    {
+      addTcWlsPositionPrior(graph, k, wls_p, tc_wls_xy_sigma_, tc_wls_z_sigma_);
     }
 
     // addTcWlsPositionPriorDropout: softer WLS prior used when there is no
@@ -940,6 +982,20 @@ namespace uwb_imu_fusion
                      gtsam::noiseModel::Diagonal::Sigmas(sig));
     }
 
+    double wlsInnovationDistance(const Eigen::Vector3d &wls_p) const
+    {
+      const auto &tp = tc_.pose.translation();
+      const double dx = wls_p.x() - tp.x();
+      const double dy = wls_p.y() - tp.y();
+      return std::sqrt(dx * dx + dy * dy); // XY only — Z less reliable
+    }
+
+    bool wlsNeedsRescuePrior(const Eigen::Vector3d &wls_p) const
+    {
+      return tc_wls_rescue_gate_ > 0.0 &&
+             wlsInnovationDistance(wls_p) > tc_wls_rescue_gate_;
+    }
+
     // wlsPassesInnovationGate: returns true if the WLS solution is consistent
     // with the current TC position estimate within wls_innovation_gate_ metres.
     //
@@ -953,10 +1009,7 @@ namespace uwb_imu_fusion
     {
       if (wls_innovation_gate_ <= 0.0)
         return true; // gate disabled
-      const auto &tp = tc_.pose.translation();
-      const double dx = wls_p.x() - tp.x();
-      const double dy = wls_p.y() - tp.y();
-      const double dist = std::sqrt(dx * dx + dy * dy); // XY only — Z less reliable
+      const double dist = wlsInnovationDistance(wls_p);
       if (dist > wls_innovation_gate_)
       {
         ROS_WARN_THROTTLE(0.5,
@@ -1004,6 +1057,7 @@ namespace uwb_imu_fusion
       // ── Position: WLS prior (softer than normal — no IMU orientation) ────────
       if (wls_gated)
         addTcWlsPositionPriorDropout(graph, k, wls_p);
+      addTcAttitudePrior(graph, k, tc_.pose.translation());
 
       // ── Velocity: tight prior pulling toward current estimate ─────────────────
       // During a dropout the last velocity is stale.  We damp it toward the
@@ -1091,6 +1145,7 @@ namespace uwb_imu_fusion
 
       if (wls_ok)
         addTcWlsPositionPrior(graph, 0, wls_p);
+      addTcAttitudePrior(graph, 0, tc_.pose.translation());
       if (wls_ok)
         addTcVerticalPrior(graph, 0, tc_.pose.translation(), wls_p.z());
 
@@ -1165,13 +1220,29 @@ namespace uwb_imu_fusion
       const bool wls_gated = wls_ok && wlsPassesInnovationGate(wls_p);
       if (wls_gated)
       {
-        addTcWlsPositionPrior(graph, k, wls_p);
+        if (wlsNeedsRescuePrior(wls_p))
+        {
+          addTcWlsPositionPrior(graph, k, wls_p,
+                                tc_wls_rescue_xy_sigma_,
+                                tc_wls_rescue_z_sigma_);
+          ROS_WARN_THROTTLE(0.5,
+                            "[TC-FGO] WLS rescue prior active: WLS↔TC_XY=%.3f m "
+                            "(xy_sigma=%.3f z_sigma=%.3f)",
+                            wlsInnovationDistance(wls_p),
+                            tc_wls_rescue_xy_sigma_,
+                            tc_wls_rescue_z_sigma_);
+        }
+        else
+        {
+          addTcWlsPositionPrior(graph, k, wls_p);
+        }
         addTcVerticalPrior(graph, k, pred_nav.pose().translation(), wls_p.z());
       }
       else
       {
         addTcVerticalPrior(graph, k, pred_nav.pose().translation(), pred_nav.pose().z());
       }
+      addTcAttitudePrior(graph, k, pred_nav.pose().translation());
 
       for (const auto &m : meas)
         graph.add(TdoaFactor(X(k), anchors_[m.idA], anchors_[m.idB],
@@ -1299,6 +1370,11 @@ namespace uwb_imu_fusion
       ROS_INFO("[uwb_imu_fusion] tc WLS position prior: %s  xy_sigma=%.3f z_sigma=%.3f",
                tc_use_wls_position_prior_ ? "enabled" : "disabled",
                tc_wls_xy_sigma_, tc_wls_z_sigma_);
+      ROS_INFO("[uwb_imu_fusion] tc WLS rescue: gate=%.3f xy_sigma=%.3f z_sigma=%.3f",
+               tc_wls_rescue_gate_, tc_wls_rescue_xy_sigma_, tc_wls_rescue_z_sigma_);
+      ROS_INFO("[uwb_imu_fusion] tc attitude prior: %s  roll_pitch_sigma=%.3f yaw_sigma=%.1e",
+               tc_use_attitude_prior_ ? "enabled" : "disabled",
+               tc_attitude_roll_pitch_sigma_, tc_attitude_yaw_sigma_);
     }
 
     void printCycleInfo(double t_mid, bool wls_ok,
@@ -1405,6 +1481,12 @@ namespace uwb_imu_fusion
     bool tc_use_wls_position_prior_{true};
     double tc_wls_xy_sigma_{0.25}; // [m] balanced XY trust
     double tc_wls_z_sigma_{0.35};  // [m] looser Z: WLS Z less reliable
+    double tc_wls_rescue_gate_{0.25};     // [m] strengthen WLS prior above this XY gap
+    double tc_wls_rescue_xy_sigma_{0.08}; // [m] rescue-mode horizontal WLS prior
+    double tc_wls_rescue_z_sigma_{0.25};  // [m] rescue-mode vertical WLS prior
+    bool tc_use_attitude_prior_{true};
+    double tc_attitude_roll_pitch_sigma_{0.05}; // [rad] strong roll/pitch leveling
+    double tc_attitude_yaw_sigma_{1e6};          // [rad] yaw effectively free
     // IMU-dropout fallback parameters
     double tc_wls_dropout_xy_sigma_{0.40}; // [m] softer WLS prior when no IMU
     double tc_dropout_vel_sigma_{0.1};     // [m/s] tight vel prior to stop phantom drift

@@ -19,7 +19,7 @@
 
     <!-- Log path -->
     <arg name="trajectory_log_path"
-         default="$(find uwb_imu_fusion)/output/uwb_imu_trajectory_tc.csv" />
+         default="$(find uwb_imu_fusion)/output/uwb_imu_trajectory_tc_260429.csv" />
     <arg name="imu_log_path"
          default="$(find uwb_imu_fusion)/output/uwb_imu_raw_imu.csv" />
 
@@ -89,10 +89,31 @@
     <!-- tc_wls_z_sigma  = 0.35 m: looser — WLS Z is weaker due to poor       -->
     <!--   vertical anchor geometry; locking Z too tightly cascades into       -->
     <!--   XY errors (TC Z drifted to -0.034 m when GT was 0.085 m).          -->
+    <!--                                                                       -->
+    <!-- tc_wls_rescue_*: stronger WLS anchoring when TC begins separating     -->
+    <!--   from WLS but is still below the hard rejection gate. This targets   -->
+    <!--   the observed ~12.5 s failure where WLS stayed near GT while TC      -->
+    <!--   developed an excessive velocity/attitude transient.                -->
     <!-- ==================================================================== -->
     <arg name="tc_use_wls_position_prior" default="true" />
     <arg name="tc_wls_xy_sigma"           default="0.25" />
     <arg name="tc_wls_z_sigma"            default="0.35" />
+    <arg name="tc_wls_rescue_gate"        default="0.25" />
+    <arg name="tc_wls_rescue_xy_sigma"    default="0.08" />
+    <arg name="tc_wls_rescue_z_sigma"     default="0.25" />
+
+    <!-- ==================================================================== -->
+    <!-- ATTITUDE STABILIZATION (TC graph)                                    -->
+    <!--                                                                       -->
+    <!-- TDOA constrains translation only. Roll/pitch drift can project        -->
+    <!-- gravity into horizontal acceleration and create impossible velocity   -->
+    <!-- spikes. Keep roll/pitch near the leveled startup attitude; leave yaw  -->
+    <!-- effectively free because UWB TDOA does not observe heading.           -->
+    <!-- ==================================================================== -->
+    <arg name="tc_use_attitude_prior"          default="true" />
+    <arg name="tc_attitude_roll_pitch_sigma"   default="0.05" />
+    <arg name="tc_attitude_yaw_sigma"          default="1e6"  />
+
     <!-- IMU dropout fallback — applied when imu_n < min_imu_per_cycle      -->
     <!-- tc_wls_dropout_xy_sigma: softer WLS prior (no IMU = less orientation confidence) -->
     <!-- tc_dropout_vel_sigma: tight velocity prior to prevent phantom drift during gap     -->
@@ -171,6 +192,12 @@
         <param name="tc_use_wls_position_prior"   value="$(arg tc_use_wls_position_prior)"   />
         <param name="tc_wls_xy_sigma"             value="$(arg tc_wls_xy_sigma)"             />
         <param name="tc_wls_z_sigma"              value="$(arg tc_wls_z_sigma)"              />
+        <param name="tc_wls_rescue_gate"          value="$(arg tc_wls_rescue_gate)"          />
+        <param name="tc_wls_rescue_xy_sigma"      value="$(arg tc_wls_rescue_xy_sigma)"      />
+        <param name="tc_wls_rescue_z_sigma"       value="$(arg tc_wls_rescue_z_sigma)"       />
+        <param name="tc_use_attitude_prior"       value="$(arg tc_use_attitude_prior)"       />
+        <param name="tc_attitude_roll_pitch_sigma" value="$(arg tc_attitude_roll_pitch_sigma)" />
+        <param name="tc_attitude_yaw_sigma"       value="$(arg tc_attitude_yaw_sigma)"       />
         <param name="tc_wls_dropout_xy_sigma"     value="$(arg tc_wls_dropout_xy_sigma)"     />
         <param name="tc_dropout_vel_sigma"        value="$(arg tc_dropout_vel_sigma)"        />
         <param name="wls_innovation_gate"         value="$(arg wls_innovation_gate)"         />

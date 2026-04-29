@@ -1,0 +1,230 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{siunitx}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{float}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+
+\title{Technical Report: Tightly Coupled UWB--IMU Fusion Pipeline}
+\author{Package: \texttt{uwb\_imu\_fusion}}
+\date{Generated from \texttt{uwb\_imu\_fusion.launch} and \texttt{260427\_const1\_3\_2\_uwb\_imu\_trajectory\_tc.csv}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report documents the ROS pipeline launched by \texttt{launch/uwb\_imu\_fusion.launch}. The implementation fuses ultra-wideband (UWB) time-difference-of-arrival (TDOA) measurements with inertial measurements in a tightly coupled factor graph. A Gauss--Newton UWB-only solver provides a weighted-least-squares-style front-end estimate, while the back-end inserts raw TDOA factors, IMU preintegration, bias evolution, velocity regularization, WLS position priors, and vertical priors into a GTSAM iSAM2 optimizer. The evaluated dataset contains 1,828 UWB cycles over \SI{52.94}{s}.
+\end{abstract}
+
+\section{Pipeline Overview}
+
+The launch file starts \texttt{uwb\_imu\_fusion\_node} and optionally starts \texttt{uwb\_imu\_fusion\_viz\_node} and RViz. The primary node subscribes to IMU, TDOA, and ground-truth pose topics; publishes WLS and tightly coupled odometry/path outputs; and writes cycle-level trajectory logs. The code-level pipeline is:
+
+\begin{enumerate}[leftmargin=*]
+  \item IMU samples are converted to SI units and buffered.
+  \item UWB TDOA messages are validated and grouped into short cycles.
+  \item Each cycle is solved by a UWB-only Gauss--Newton front end.
+  \item The same raw TDOA cycle is inserted into a tightly coupled factor graph.
+  \item IMU samples between UWB cycle times are preintegrated into one motion factor.
+  \item iSAM2 incrementally optimizes pose, velocity, and IMU bias.
+\end{enumerate}
+
+The launch configuration sets the key physical and estimator parameters: acceleration is interpreted as \texttt{g} and scaled by \SI{9.80665}{m/s^2}; gyroscope data is interpreted as degrees per second and converted to radians per second; TDOA noise is \SI{0.3}{m}; robust Huber loss is enabled with \(k=1.345\); the WLS prior uses \SI{0.25}{m} in \(x,y\) and \SI{0.35}{m} in \(z\); and the vertical prior sigma is \SI{0.2}{m}.
+
+\section{State and Sensor Models}
+
+At UWB cycle \(k\), the tightly coupled state is
+\begin{equation}
+  \mathcal{X}_k = \{X_k, v_k, b_k\},
+\end{equation}
+where \(X_k \in SE(3)\) is a GTSAM \texttt{Pose3}, \(v_k \in \mathbb{R}^3\) is velocity, and \(b_k = (b^a_k,b^\omega_k)\) is the accelerometer and gyroscope bias.
+
+\subsection{TDOA Measurement}
+
+For anchors \(a_A,a_B \in \mathbb{R}^3\) and tag position \(p\), the TDOA measurement in the WLS front end is modeled as
+\begin{equation}
+  z_i = \|p-a_B\| - \|p-a_A\| + \eta_i.
+\end{equation}
+The residual used by \texttt{include/wlssolver.h} is
+\begin{equation}
+  r_i(p) = \left(\|p-a_B\| - \|p-a_A\|\right) - z_i.
+\end{equation}
+The corresponding Jacobian is
+\begin{equation}
+  \frac{\partial r_i}{\partial p}
+  =
+  \frac{p-a_B}{\|p-a_B\|}
+  -
+  \frac{p-a_A}{\|p-a_A\|}.
+\end{equation}
+
+The custom GTSAM factor in \texttt{include/tdoa\_factor.h} uses the internal prediction \(\|p-a_A\|-\|p-a_B\|\), so the node passes \(-z_i\) when adding a factor. This keeps the graph residual consistent with the WLS residual sign convention.
+
+\subsection{IMU Preintegration}
+
+The IMU model follows standard preintegrated inertial navigation. Given calibrated accelerometer and gyroscope readings
+\begin{align}
+  \tilde{a}_t &= a_t + b^a_t + n^a_t, \\
+  \tilde{\omega}_t &= \omega_t + b^\omega_t + n^\omega_t,
+\end{align}
+all IMU samples between cycle times \(t_{k-1}\) and \(t_k\) are summarized by a single preintegrated measurement \(\Delta \hat{I}_{k-1,k}\). The graph adds an \texttt{ImuFactor}
+\begin{equation}
+  e^{\mathrm{imu}}_k =
+  h_{\mathrm{imu}}\!\left(X_{k-1},v_{k-1},X_k,v_k,b_{k-1},\Delta \hat{I}_{k-1,k}\right).
+\end{equation}
+The bias random walk is represented by
+\begin{equation}
+  b_k = b_{k-1} + w_b,\qquad
+  \sigma_b(\Delta t)=\sigma_{\mathrm{rw}}\sqrt{\Delta t}.
+\end{equation}
+
+\section{Algorithms}
+
+\subsection{UWB Front End}
+
+The front end solves the nonlinear least-squares objective
+\begin{equation}
+  \min_p \sum_i r_i(p)^2.
+\end{equation}
+At iteration \(j\), it linearizes \(r(p_j+\delta p)\approx r(p_j)+J\delta p\) and solves
+\begin{equation}
+  (J^\top J)\delta p = -J^\top r.
+\end{equation}
+The state is updated as \(p_{j+1}=p_j+\delta p\), and convergence is declared when \(\|\delta p\|\) falls below the configured tolerance. The solver requires at least three TDOA measurements and clamps small anchor distances to avoid division by zero.
+
+\subsection{Tightly Coupled Factor Graph}
+
+The back-end minimizes the following cycle-wise factor objective:
+\begin{equation}
+  \min_{\mathcal{X}_{0:k}}
+  \sum_i \|e^{\mathrm{tdoa}}_{k,i}\|_{\Sigma_{\mathrm{tdoa}}}^2
+  + \|e^{\mathrm{imu}}_k\|_{\Sigma_{\mathrm{imu}}}^2
+  + \|b_k-b_{k-1}\|_{\Sigma_b}^2
+  + \|v_k-\hat{v}_k\|_{\Sigma_v}^2
+  + \|X_k-\hat{X}^{\mathrm{wls}}_k\|_{\Sigma_{\mathrm{wls}}}^2
+  + \|z_k-\hat{z}_k\|_{\sigma_z}^2.
+\end{equation}
+Not every term is active in every cycle. The WLS position prior is optional and gated. The vertical prior is active when configured. During normal operation, the graph includes one raw TDOA factor for every TDOA measurement in the current cycle, an IMU factor, a bias between factor, and velocity/bias priors.
+
+The TDOA residual is wrapped by a Huber robust loss:
+\begin{equation}
+  \rho(s)=
+  \begin{cases}
+    \frac{1}{2}s^2, & |s|\le k,\\
+    k(|s|-\frac{1}{2}k), & |s|>k,
+  \end{cases}
+\end{equation}
+with \(k=1.345\). This reduces the influence of NLOS or multipath outliers without discarding nominal measurements.
+
+\subsection{Initialization and Dropout Handling}
+
+The initial graph node is seeded from the configured initial pose or the first valid WLS position. Roll and pitch can be initialized by averaging the first 100 accelerometer samples:
+\begin{align}
+  \phi &= \operatorname{atan2}(\bar{a}_y,\bar{a}_z),\\
+  \theta &= \operatorname{atan2}(-\bar{a}_x,\sqrt{\bar{a}_y^2+\bar{a}_z^2}).
+\end{align}
+Yaw is kept from the configured initial pose.
+
+If a cycle contains fewer than the minimum required IMU samples, the node switches to a dropout update. In this mode no \texttt{ImuFactor} is added; raw TDOA factors remain active; WLS can still be used with a softer prior; velocity is damped with a tight prior; and bias is carried forward. This prevents stale velocity from producing phantom drift during brief IMU gaps.
+
+\section{Implementation Key Points}
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Tightly coupled UWB:} the graph does not fuse only the WLS position. It inserts every raw TDOA measurement as a custom factor.
+  \item \textbf{Unit correctness:} acceleration is converted from \texttt{g} to \(\si{m/s^2}\), and gyroscope values are converted from \(\si{deg/s}\) to \(\si{rad/s}\). This is essential because IMU preintegration assumes SI units.
+  \item \textbf{Robust TDOA weighting:} \(\sigma_{\mathrm{tdoa}}=\SI{0.3}{m}\) and the Huber kernel reduce the impact of UWB outliers.
+  \item \textbf{Bias observability:} the initial bias prior is deliberately not over-tightened, allowing the graph to move away from zero bias.
+  \item \textbf{Weak vertical geometry:} WLS \(z\) is treated more loosely than \(x,y\), and a dedicated vertical prior keeps altitude stable.
+  \item \textbf{Innovation gating:} WLS priors are rejected when the WLS--TC horizontal discrepancy exceeds \SI{0.8}{m}.
+\end{itemize}
+
+\section{Experimental Result}
+
+The evaluated CSV is \texttt{output/260427\_const1\_3\_2\_uwb\_imu\_trajectory\_tc.csv}. It contains one row per UWB cycle, including ground truth, WLS output, tightly coupled output, state estimates, IMU summary statistics, and position errors.
+
+\begin{table}[H]
+  \centering
+  \caption{3D position error statistics in meters.}
+  \input{metrics_table.tex}
+  \label{tab:metrics}
+\end{table}
+
+The WLS-only solution gives a mean error of \SI{0.186}{m} and RMSE of \SI{0.225}{m}. The tightly coupled graph gives a mean error of \SI{0.192}{m} and RMSE of \SI{0.235}{m}, while improving the median error from \SI{0.142}{m} to \SI{0.128}{m}. Thus, on this dataset the TC estimator has a better central tendency but slightly worse tail/RMSE behavior. TC has lower error than WLS on 46.8\% of cycles. This suggests that the IMU and graph priors smooth a large part of the trajectory, but a subset of cycles still receives enough bias or vertical influence to increase the squared-error tail.
+
+The dataset contains 227 low-IMU cycles, or 12.4\% of all cycles. The dropout handling is therefore not a corner case; it is part of the operating regime for this run. Mean absolute vertical error is \SI{0.064}{m} for WLS and \SI{0.066}{m} for TC, consistent with the report's design assumption that \(z\) should be treated cautiously.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.82\linewidth]{trajectory_xy.png}
+  \caption{Ground truth, WLS, and tightly coupled trajectories in the horizontal plane.}
+  \label{fig:trajectory}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.9\linewidth]{error_timeseries.png}
+  \caption{Position error over time and the per-cycle error difference between TC and WLS.}
+  \label{fig:error_time}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.72\linewidth]{error_cdf.png}
+  \caption{Empirical cumulative distribution of 3D position error.}
+  \label{fig:cdf}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.72\linewidth]{error_histogram.png}
+  \caption{Histogram of 3D position error over all evaluated UWB cycles.}
+  \label{fig:histogram}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.9\linewidth]{state_diagnostics.png}
+  \caption{Vertical trajectory, tightly coupled speed estimate, and IMU samples per cycle.}
+  \label{fig:diagnostics}
+\end{figure}
+
+\section{Accuracy Discussion}
+
+The absolute positioning accuracy is good for a practical UWB indoor setup: both estimators stay below \SI{0.25}{m} RMSE, and their 95th percentile errors are below \SI{0.46}{m}. WLS performs strongly because the anchor geometry and the UWB cycle batching are already sufficient for direct localization. The TC graph adds physically meaningful smoothing, bias estimation, and dropout protection, but in this particular run its additional constraints do not produce a lower RMSE than WLS.
+
+The most important interpretation is therefore not ``TC always improves error,'' but rather: the implemented TC pipeline is a robust, model-rich estimator whose behavior is close to WLS accuracy while also estimating velocity, attitude, and IMU bias. Further RMSE improvement would likely come from tuning the WLS prior strength, reducing vertical coupling, analyzing outlier cycles where TC exceeds WLS, and validating the IMU gravity/attitude assumptions with an independent attitude reference.
+
+\section{Reproducibility}
+
+The figures and tables were generated with:
+\begin{verbatim}
+python3 report/generate_report_assets.py \
+  --csv output/260427_const1_3_2_uwb_imu_trajectory_tc.csv \
+  --out-dir report
+\end{verbatim}
+
+The companion files are:
+\begin{itemize}[leftmargin=*]
+  \item \texttt{report/metrics.json}: exact numerical metrics.
+  \item \texttt{report/metrics\_table.tex}: LaTeX table input.
+  \item \texttt{report/trajectory\_replay.gif}: animated trajectory replay for markdown or presentation use.
+  \item \texttt{report/generate\_report\_assets.py}: reproducible plotting script.
+\end{itemize}
+
+\section{Conclusion}
+
+The \texttt{uwb\_imu\_fusion.launch} pipeline implements a full tightly coupled UWB--IMU estimator rather than a loosely coupled pose fusion method. Its core strengths are raw TDOA graph factors, IMU preintegration, robust noise modeling, adaptive dropout behavior, careful unit conversion, and practical priors for weak vertical observability. On the supplied dataset, the WLS and TC outputs both achieve sub-\SI{0.25}{m} RMSE. TC improves the median error and provides a richer navigation state, while WLS remains slightly better in RMSE and mean error for this specific run.
+
+\end{document}

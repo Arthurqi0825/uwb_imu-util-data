@@ -72,3 +72,14 @@ target_link_libraries(uwb_imu_lc_wls_fusion_node
   ${catkin_LIBRARIES}
   gtsam
 )
+
+add_executable(integrity_uwb_node
+  src/integrity_uwb_node.cpp
+)
+add_dependencies(integrity_uwb_node
+  ${catkin_EXPORTED_TARGETS}
+)
+target_link_libraries(integrity_uwb_node
+  ${catkin_LIBRARIES}
+  gtsam
+)

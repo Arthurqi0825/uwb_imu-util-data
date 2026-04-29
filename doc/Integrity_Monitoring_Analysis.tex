@@ -1,0 +1,112 @@
+
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath, amssymb, amsfonts}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{titlesec}
+\usepackage{booktabs}
+\usepackage{bm}
+
+\geometry{margin=1in}
+
+\definecolor{navyblue}{RGB}{0, 0, 128}
+\definecolor{darkgray}{RGB}{60, 60, 60}
+
+\titleformat{\section}{\large\bfseries\color{navyblue}}{\thesection}{1em}{}[{\titlerule[0.8pt]}]
+\titleformat{\subsection}{\normalsize\bfseries\color{darkgray}}{\thesubsection}{1em}{}
+
+\title{
+    \vspace{-2cm}
+    \textbf{\huge Integrity Monitoring in Navigation Systems} \\
+    \large Statistical Methods: Chi-Square Residual Testing and Protection Levels
+}
+\author{Technical Brief: RAIM Principles}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction to Integrity Monitoring}
+Integrity is a measure of the trust that can be placed in the correctness of the information supplied by a navigation system. Receiver Autonomous Integrity Monitoring (RAIM) provides a mechanism for a GPS receiver to detect if a satellite is providing corrupted information using redundant measurements.
+
+\section{The Observation Model}
+The linearized measurement equation for $n$ satellites is given by:
+\begin{equation}
+    \mathbf{y} = \mathbf{G}\mathbf{x} + \bm{\epsilon}
+\end{equation}
+Where:
+\begin{itemize}
+    \item $\mathbf{y}$ is the $n \times 1$ vector of pseudorange residuals (observed minus predicted).
+    \item $\mathbf{G}$ is the $n \times 4$ geometry matrix (observation matrix).
+    \item $\mathbf{x}$ is the $4 \times 1$ state vector (position and clock bias errors).
+    \item $\bm{\epsilon}$ is the measurement noise, assumed $\mathcal{N}(0, \sigma^2 \mathbf{I})$.
+\end{itemize}
+
+The Least Squares (LS) estimate of the state is:
+\begin{equation}
+    \hat{\mathbf{x}} = (\mathbf{G}^T \mathbf{G})^{-1} \mathbf{G}^T \mathbf{y}
+\end{equation}
+
+\section{Chi-Square ($\chi^2$) Fault Detection}
+Fault detection is typically performed using the Sum of Squared Errors (SSE) of the residuals. The residual vector $\mathbf{r}$ is defined as:
+\begin{equation}
+    \mathbf{r} = \mathbf{y} - \mathbf{G}\hat{\mathbf{x}} = (\mathbf{I} - \mathbf{G}(\mathbf{G}^T \mathbf{G})^{-1} \mathbf{G}^T) \mathbf{y}
+\end{equation}
+
+The test statistic $SSE$ is calculated as:
+\begin{equation}
+    SSE = \mathbf{r}^T \mathbf{r}
+\end{equation}
+
+Under the null hypothesis (no fault), the normalized statistic $SSE / \sigma^2$ follows a Chi-square distribution with $n-4$ degrees of freedom:
+\begin{equation}
+    \frac{SSE}{\sigma^2} \sim \chi^2(n-4)
+\end{equation}
+
+A fault is detected if $SSE > T_{critical}$, where $T_{critical}$ is determined by the required False Alarm Rate ($P_{fa}$).
+
+\section{Protection Levels: HPL and VPL}
+The \textbf{Horizontal Protection Level (HPL)} and \textbf{Vertical Protection Level (VPL)} are statistical bounds that describe the position error. They ensure that the probability of the true position error exceeding the protection level without an alarm is below the specified Integrity Risk.
+
+\subsection{HPL Calculation (Slope-Based Method)}
+The HPL is derived from the relationship between the measurement bias and the resulting position error. For each satellite $i$, a "slope" is defined:
+\begin{equation}
+    Slope_i = \frac{\text{Horizontal Error caused by bias in sat } i}{\text{RMS of Residuals caused by bias in sat } i}
+\end{equation}
+
+The HPL is generally computed as:
+\begin{equation}
+    HPL = K(P_{md}) \times \sigma_{max\_slope} \times \sqrt{T_{critical}}
+\end{equation}
+Where $K(P_{md})$ is a constant based on the probability of missed detection.
+
+\section{Alert Limits: HAL and VAL}
+The \textbf{Horizontal Alert Limit (HAL)} and \textbf{Vertical Alert Limit (VAL)} are the maximum allowable position errors for a specific phase of flight (e.g., En-route, Terminal, or Approach).
+
+\subsection{Integrity Condition}
+The system is considered "Available" for the mission if:
+\begin{equation}
+    \text{HPL} < \text{HAL} \quad \text{and} \quad \text{VPL} < \text{VAL}
+\end{equation}
+
+If $HPL > HAL$, the integrity of the solution cannot be guaranteed, and a "RAIM Unavailable" warning is issued to the pilot, even if no actual fault is detected.
+
+\section{Summary Table}
+\begin{table}[h]
+\centering
+\begin{tabular}{lll}
+\toprule
+\textbf{Parameter} & \textbf{Definition} & \textbf{Role} \\
+\midrule
+SSE & Sum of Squared Errors & Statistical Test Statistic \\
+$T_{critical}$ & Detection Threshold & Decision boundary based on $\chi^2$ \\
+HPL & Horizontal Protection Level & Computed statistical bound of error \\
+HAL & Horizontal Alert Limit & Maximum tolerable error (Requirement) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}
