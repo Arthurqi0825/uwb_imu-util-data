@@ -4,6 +4,11 @@
   <!-- uwb_imu_fusion — UWB + IMU fusion node                      -->
   <!-- =========================================================== -->
 
+  <!-- Path to anchors/noise config. This launch uses the plain LS front-end:
+       no dynamic WLS refinement and no integrity monitor. -->
+  <arg name="config_file"
+       default="$(find uwb_imu_fusion)/config/anchors.yaml" />
+
   <!-- Topic remapping -->
   <arg name="imu_topic"  default="/imu_data"   />
   <arg name="uwb_topic"  default="/tdoa_data"  />
@@ -17,61 +22,47 @@
   <arg name="odom_frame" default="map"       />
   <arg name="base_frame" default="base_link" />
 
-  <!-- Log output path -->
-  <arg name="residual_log_path"
-       default="$(find uwb_imu_fusion)/output/uwb_imu_residuals.csv" />
+  <!-- IMU unit flags -->
+  <arg name="imu_accel_in_g"  default="true" />
+  <arg name="gyro_is_degrees" default="true" />
+
+  <!-- Log output paths -->
+  <arg name="trajectory_log_path"
+       default="$(find uwb_imu_fusion)/output/uwb_ls_fusion_trajectory.csv" />
+  <arg name="imu_log_path"
+       default="$(find uwb_imu_fusion)/output/uwb_ls_fusion_raw_imu.csv" />
 
   <!-- IMU physics -->
-  <arg name="gravity_magnitude" default="0.0" />
+  <arg name="gravity_magnitude" default="9.80665" />
 
-  <!-- FGO prior sigmas -->
-  <arg name="pose_prior_sigma" default="0.05" />
-  <arg name="vel_prior_sigma"  default="0.5"  />
-  <arg name="bias_prior_sigma" default="0.3"  />
+  <!-- TC-FGO prior sigmas -->
+  <arg name="tc_prior_pose_sigmas" default="[0.5, 0.5, 0.5, 0.05, 0.05, 0.05]" />
+  <arg name="tc_prior_vel_sigma"   default="0.1" />
+  <arg name="tc_prior_bias_sigma"  default="0.1" />
+  <arg name="tc_update_vel_sigma"  default="0.5" />
+  <arg name="tc_update_bias_sigma" default="0.1" />
 
   <!-- IMU noise model -->
-  <arg name="imu_acc_noise"      default="0.1"   />
-  <arg name="imu_gyro_noise"     default="0.01"  />
-  <arg name="imu_acc_bias_noise" default="0.01"  />
-  <arg name="imu_gyro_bias_noise"default="0.001" />
+  <arg name="tc_accel_noise_sigma"       default="0.04" />
+  <arg name="tc_gyro_noise_sigma"        default="0.003" />
+  <arg name="tc_accel_bias_rw_sigma"     default="0.01" />
+  <arg name="tc_gyro_bias_rw_sigma"      default="0.0003" />
+  <arg name="tc_integration_noise_sigma" default="1e-4" />
 
-  <!-- UWB noise -->
+  <!-- UWB factor noise. Plain LS front-end uses unweighted solve(); this sigma
+       is for the raw TDOA factors in the TC-FGO back-end. -->
   <arg name="tdoa_sigma" default="0.5" />
 
-  <!-- Initial IMU bias (set if known from calibration) -->
-  <arg name="initial_acc_bias_x"  default="0.0" />
-  <arg name="initial_acc_bias_y"  default="0.0" />
-  <arg name="initial_acc_bias_z"  default="0.0" />
-  <arg name="initial_gyro_bias_x" default="0.0" />
-  <arg name="initial_gyro_bias_y" default="0.0" />
-  <arg name="initial_gyro_bias_z" default="0.0" />
-
-  <!-- =========================================================== -->
-  <!-- Anchor positions — edit to match your room setup            -->
-  <!-- Each anchor: [x, y, z] in metres relative to world origin   -->
-  <!-- =========================================================== -->
-  <rosparam param="/uwb_imu_fusion/anchors">
-    [
-        [-2.4175, -4.0208, 0.1818],   
-        [-2.8205, 3.5250, 2.5874] ,   
-        [3.4819, 3.3050, 0.1545] ,    
-        [3.4507, -3.7181, 2.6693] ,   
-        [-3.2776, -3.8690, 2.6739],   
-        [3.2655, -3.6511, 0.1752],    
-        [3.8321, 3.6521, 2.6249] ,    
-        [-2.7228, 3.2191, 0.1583]
-    ]
-  </rosparam>
-
-  <!-- Optional UWB tag extrinsic (offset from body origin to UWB antenna) -->
-  <rosparam param="/uwb_imu_fusion/anchor_extrinsic_translation">[-0.03,-0.05,-0.15]</rosparam>
+  <rosparam ns="uwb_imu_fusion"
+            file="$(arg config_file)"
+            command="load" />
 
   <!-- =========================================================== -->
   <!-- Fusion node                                                  -->
   <!-- =========================================================== -->
   <node pkg="uwb_imu_fusion"
-        type="uwb_wls_fusion_node"
-        name="uwb_wls_fusion_node"
+        type="uwb_imu_fusion_node"
+        name="uwb_ls_fusion_node"
         output="screen">
 
     <!-- Topic remapping -->
@@ -83,33 +74,33 @@
     <param name="odom_frame" value="$(arg odom_frame)" />
     <param name="base_frame" value="$(arg base_frame)" />
 
-    <!-- Log -->
-    <param name="residual_log_path" value="$(arg residual_log_path)" />
+    <!-- IMU unit flags -->
+    <param name="imu_accel_in_g"  value="$(arg imu_accel_in_g)"  />
+    <param name="gyro_is_degrees" value="$(arg gyro_is_degrees)" />
+
+    <!-- Logs -->
+    <param name="trajectory_log_path" value="$(arg trajectory_log_path)" />
+    <param name="imu_log_path"        value="$(arg imu_log_path)"        />
 
     <!-- IMU physics -->
     <param name="gravity_magnitude" value="$(arg gravity_magnitude)" />
 
-    <!-- FGO priors -->
-    <param name="pose_prior_sigma" value="$(arg pose_prior_sigma)" />
-    <param name="vel_prior_sigma"  value="$(arg vel_prior_sigma)"  />
-    <param name="bias_prior_sigma" value="$(arg bias_prior_sigma)" />
+    <!-- TC-FGO priors -->
+    <rosparam param="tc_prior_pose_sigmas" subst_value="true">$(arg tc_prior_pose_sigmas)</rosparam>
+    <param name="tc_prior_vel_sigma"   value="$(arg tc_prior_vel_sigma)"   />
+    <param name="tc_prior_bias_sigma"  value="$(arg tc_prior_bias_sigma)"  />
+    <param name="tc_update_vel_sigma"  value="$(arg tc_update_vel_sigma)"  />
+    <param name="tc_update_bias_sigma" value="$(arg tc_update_bias_sigma)" />
 
     <!-- IMU noise -->
-    <param name="imu_acc_noise"       value="$(arg imu_acc_noise)"       />
-    <param name="imu_gyro_noise"      value="$(arg imu_gyro_noise)"      />
-    <param name="imu_acc_bias_noise"  value="$(arg imu_acc_bias_noise)"  />
-    <param name="imu_gyro_bias_noise" value="$(arg imu_gyro_bias_noise)" />
+    <param name="tc_accel_noise_sigma"       value="$(arg tc_accel_noise_sigma)"       />
+    <param name="tc_gyro_noise_sigma"        value="$(arg tc_gyro_noise_sigma)"        />
+    <param name="tc_accel_bias_rw_sigma"     value="$(arg tc_accel_bias_rw_sigma)"     />
+    <param name="tc_gyro_bias_rw_sigma"      value="$(arg tc_gyro_bias_rw_sigma)"      />
+    <param name="tc_integration_noise_sigma" value="$(arg tc_integration_noise_sigma)" />
 
     <!-- UWB noise -->
     <param name="tdoa_sigma" value="$(arg tdoa_sigma)" />
-
-    <!-- Initial IMU bias -->
-    <param name="initial_acc_bias_x"  value="$(arg initial_acc_bias_x)"  />
-    <param name="initial_acc_bias_y"  value="$(arg initial_acc_bias_y)"  />
-    <param name="initial_acc_bias_z"  value="$(arg initial_acc_bias_z)"  />
-    <param name="initial_gyro_bias_x" value="$(arg initial_gyro_bias_x)" />
-    <param name="initial_gyro_bias_y" value="$(arg initial_gyro_bias_y)" />
-    <param name="initial_gyro_bias_z" value="$(arg initial_gyro_bias_z)" />
 
     <!-- UWB cycle tuning -->
     <param name="measurements_per_cycle" value="8"    />
@@ -127,7 +118,7 @@
   <!-- =========================================================== -->
   <group if="$(arg enable_rviz)">
     <node pkg="rviz" type="rviz" name="rviz"
-          args="-d $(find uwb_imu_fusion)/rviz/fusion.rviz"
+          args="-d $(find uwb_imu_fusion)/config/viz.rviz"
           required="false" />
   </group>
 

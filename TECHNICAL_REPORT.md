@@ -12,6 +12,7 @@ The node publishes two motion estimates:
 
 - a **WLS-only UWB position estimate**
 - a **tightly coupled factor-graph fusion estimate**
+- an optional **integrity-monitoring output** for the WLS solution
 
 The implementation combines a fast front-end based on weighted least squares (WLS) with a back-end based on **GTSAM**, **IMU preintegration**, and **incremental smoothing with iSAM2**.
 
@@ -19,23 +20,27 @@ At a high level:
 
 1. IMU samples are buffered continuously.
 2. UWB TDOA samples are grouped into short measurement cycles.
-3. Each cycle is solved once with a standalone WLS position estimator.
-4. The same cycle is also added to a tightly coupled factor graph using:
+3. Each cycle is solved with a standalone WLS position estimator.
+4. In the integrity node, the first WLS solution is used to compute dynamic per-TDOA sigmas, then a weighted WLS refinement is run.
+5. The same cycle is also added to a tightly coupled factor graph using:
    - raw TDOA factors
    - IMU preintegration
    - bias evolution constraints
    - optional WLS and vertical priors
+6. The integrity monitor checks the final WLS solution using chi-squared residual testing, protection levels, and optional fault exclusion.
 
-This design gives the system two useful behaviors:
+This design gives the system three useful behaviors:
 
 - WLS provides a direct geometric position estimate from UWB alone.
 - The tightly coupled graph uses raw UWB and IMU jointly, which is usually smoother and more dynamically consistent.
+- The integrity branch reports whether the UWB-only solution is consistent enough to be used by the loosely coupled fusion path.
 
 ---
 
 ## 2. Node Architecture
 
 The main implementation is in [`src/uwb_imu_fusion_node.cpp`](./src/uwb_imu_fusion_node.cpp).
+The integrity-enabled loosely coupled implementation is in [`src/integrity_uwb_node.cpp`](./src/integrity_uwb_node.cpp).
 
 Core internal components:
 
@@ -49,9 +54,11 @@ Core internal components:
     - cycle index
     - initialization status
 - `TdoaWlsSolver`
-  - iterative Gauss-Newton solver for UWB-only position
+  - iterative Gauss-Newton solver for UWB-only position, with optional per-measurement weights
 - `TdoaFactor`
   - custom GTSAM unary factor for one TDOA measurement
+- `TdoaIntegrityMonitor`
+  - RAIM-style post-fit residual monitor for WLS TDOA solutions
 
 Main processing flow:
 
@@ -109,6 +116,7 @@ This sign convention is used in:
 
 - [`include/wlssolver.h`](./include/wlssolver.h)
 - [`include/tdoa_factor.h`](./include/tdoa_factor.h)
+- [`include/integrity_monitor.h`](./include/integrity_monitor.h)
 
 Consistency here is critical. A sign mismatch would bias both the WLS solution and the factor graph.
 
@@ -146,17 +154,60 @@ For each iteration:
 
 1. Build residual vector `r`
 2. Build Jacobian matrix `J`
-3. Solve normal equations
+3. Build the diagonal weight matrix `W`, if per-measurement sigmas are available
+4. Solve normal equations
+
+Unweighted mode:
 
 `(J^T J) dp = -J^T r`
 
-4. Update position estimate
+Weighted mode:
+
+`(J^T W J) dp = -J^T W r`
+
+where:
+
+`W = diag(1 / sigma_i^2)`
+
+5. Update position estimate
 
 `p <- p + dp`
 
-5. Stop when `||dp|| < tol`
+6. Stop when `||dp|| < tol`
 
-### 4.3 Jacobian
+### 4.3 Dynamic TDOA sigma model
+
+The integrity node performs a two-stage WLS solve:
+
+1. run an initial WLS solve from the previous position seed
+2. compute a geometry-dependent sigma for each TDOA anchor pair
+3. run a weighted WLS refinement using those sigmas
+4. recompute sigmas at the refined WLS position
+
+For one TDOA pair `(A, B)`, the per-anchor range sigmas are:
+
+`sigma_A = sigma_base + sigma_per_meter * ||p_wls - a_A||`
+
+`sigma_B = sigma_base + sigma_per_meter * ||p_wls - a_B||`
+
+The final TDOA pair sigma is:
+
+`sigma_pair = sqrt(sigma_A^2 + sigma_B^2)`
+
+This matches the variance sum for a range difference formed from two independent range-like errors. The node clamps the final sigma between configured minimum and maximum values.
+
+The same final per-pair sigmas are used by:
+
+- the weighted WLS refinement
+- integrity residual normalization
+- the chi-squared statistic
+- the protection-level covariance calculation
+
+For debugging, the node prints each pair's final sigma, weight, and the final diagonal weight matrix:
+
+`W = diag(1 / sigma_pair^2)`
+
+### 4.4 Jacobian
 
 For one TDOA residual:
 
@@ -168,7 +219,7 @@ the Jacobian with respect to position is:
 
 This is exactly what the implementation constructs.
 
-### 4.4 Numerical safeguards
+### 4.5 Numerical safeguards
 
 The solver includes:
 
@@ -552,7 +603,152 @@ This is a very practical engineering safeguard. A unit mismatch in gyro data wou
 
 ---
 
-## 12. Logging, Evaluation, and Outputs
+## 12. Integrity Monitoring
+
+The integrity-enabled node adds a RAIM-style monitor around the WLS solution. The reusable implementation is in [`include/integrity_monitor.h`](./include/integrity_monitor.h), and the node-level integration is in [`src/integrity_uwb_node.cpp`](./src/integrity_uwb_node.cpp).
+
+### 12.1 Inputs and residual model
+
+The monitor is called after WLS has converged. It receives:
+
+- one UWB measurement cycle
+- transformed anchor positions
+- final WLS position
+- optional per-TDOA sigmas from the dynamic sigma model
+
+It rebuilds the residual vector and geometry matrix:
+
+`r_i = (||p_wls-a_B|| - ||p_wls-a_A||) - z_i`
+
+`H_i = (p_wls-a_B)/||p_wls-a_B|| - (p_wls-a_A)/||p_wls-a_A||`
+
+### 12.2 Chi-squared fault detection
+
+For `M` TDOA measurements and a 3D WLS position, the residual degrees of freedom are:
+
+`dof = M - 3`
+
+The current monitor uses a diagonal TDOA covariance approximation:
+
+`Sigma = diag(sigma_i^2)`
+
+`W = Sigma^-1 = diag(1 / sigma_i^2)`
+
+The test statistic is:
+
+`T = r^T W r`
+
+A fault is detected when:
+
+`T > chi2_quantile(dof, 1 - p_fa)`
+
+When `dof == 1`, the node prints a warning because only one redundant observation is available and detection power is low.
+
+### 12.3 Position covariance
+
+The WLS position covariance approximation is:
+
+`P_pos = (H^T W H)^-1`
+
+This covariance is used for protection-level calculation.
+
+### 12.4 Corrected horizontal protection level
+
+The monitor uses the major axis of the horizontal covariance ellipse rather than the trace approximation.
+
+For the horizontal block:
+
+```text
+P_xy = [ P00  P01
+         P01  P11 ]
+```
+
+the largest eigenvalue is:
+
+`lambda_major = (P00 + P11)/2 + sqrt(((P00 - P11)/2)^2 + P01^2)`
+
+The no-fault horizontal protection level is:
+
+`HPL0 = k_hpl * sqrt(lambda_major)`
+
+The vertical protection level uses:
+
+`VPL0 = k_hpl * sqrt(P22)`
+
+This uses the actual long axis of the horizontal error ellipse rather than assuming an uncorrelated or circular horizontal uncertainty shape.
+
+### 12.5 Single-fault protection term
+
+The monitor computes the WLS influence matrix:
+
+`S = P_pos H^T W`
+
+For each measurement `k`, the horizontal fault slope is:
+
+`bias_h = sqrt(S_xk^2 + S_yk^2)`
+
+and the vertical slope is:
+
+`bias_v = |S_zk|`
+
+The monitor combines these slopes with the detection threshold and the covariance of the subset with measurement `k` excluded. The subset horizontal sigma also uses the corrected major-axis formula.
+
+The final protection levels are:
+
+`HPL = max(HPL0, HPL_fault)`
+
+`VPL = max(VPL0, VPL_fault)`
+
+### 12.6 Fault detection and exclusion
+
+If the full-cycle chi-squared test fails and enough measurements remain, the monitor tries excluding each measurement one at a time.
+
+For each candidate exclusion:
+
+1. remove one residual and one geometry row
+2. solve one weighted least-squares correction around the WLS point
+3. compute the subset chi-squared statistic
+4. keep the exclusion with the lowest statistic
+
+If that best subset passes its reduced-degree chi-squared threshold, the measurement index is reported as `excluded_idx`.
+
+### 12.7 Ring-closure check
+
+The previous simple sum of all TDOA measurements has been replaced by a true closed-loop check.
+
+For every available anchor triangle `(a, b, c)`, the monitor looks for:
+
+`TDOA(a,b) + TDOA(b,c) + TDOA(c,a)`
+
+With consistent measurements, this loop error should be close to zero. The reported `ring_sum` is now the worst signed closed-loop error, and `ring_closed_loops` records how many closed triangles were actually found.
+
+If no closed triangle exists in the cycle, `ring_closed_loops = 0` and the ring check is not treated as a failure.
+
+### 12.8 Availability decision
+
+The integrity monitor reports the WLS solution as available when:
+
+`(!fault_detected || excluded_idx >= 0) && HPL < HAL && VPL < VAL`
+
+The integrity node uses this gate before feeding the WLS position into the loosely coupled graph. A WLS solution that fails integrity is still publishable for inspection, but it is not used as a trusted fusion prior.
+
+### 12.9 Current covariance limitation
+
+The monitor currently uses a diagonal TDOA covariance matrix. This is correct when measurement errors are independent at the TDOA-pair level, but it ignores correlation caused by shared anchors.
+
+A more complete model would build:
+
+`C = D Sigma_anchor D^T`
+
+and use:
+
+`W = C^-1`
+
+where `D` maps anchor range errors into TDOA differences. That extension requires passing per-anchor range sigmas, or a full TDOA covariance matrix, into the monitor.
+
+---
+
+## 13. Logging, Evaluation, and Outputs
 
 The node logs:
 
@@ -570,11 +766,20 @@ Cycle logs include:
 - gyroscope bias
 - summarized IMU statistics over the cycle
 - WLS and tightly coupled position errors relative to ground truth
+- integrity chi-squared statistic, threshold, degrees of freedom, fault flag, HPL, VPL, availability, and FDE exclusion index
+- ring-closure worst loop error and number of closed loops
+
+The integrity node also prints:
+
+- per-TDOA sigma
+- per-TDOA weight `1 / sigma^2`
+- final diagonal WLS/integrity weight matrix
 
 Published ROS outputs include:
 
 - `uwb_wls`
 - `tc_fusion`
+- `uwb_integrity`
 - corresponding `Path` topics
 - TF for the tightly coupled solution
 
@@ -582,7 +787,7 @@ This makes the package suitable for both online use and offline analysis.
 
 ---
 
-## 13. Why This Is a Tightly Coupled Design
+## 14. Why This Is a Tightly Coupled Design
 
 The core reason this implementation is tightly coupled is:
 
@@ -600,7 +805,7 @@ This is more expressive than a loosely coupled design where UWB would first be c
 
 ---
 
-## 14. Advantages and Limitations
+## 15. Advantages and Limitations
 
 ### Advantages
 
@@ -609,6 +814,8 @@ This is more expressive than a loosely coupled design where UWB would first be c
 - WLS gives a fast UWB-only estimate and a useful seed
 - robust kernel and gating improve resilience to bad measurements
 - dropout logic improves behavior during partial sensor failure
+- integrity monitoring provides WLS fault detection, FDE, and protection-level outputs
+- dynamic per-pair sigmas make standalone WLS and integrity weighting geometry-aware
 
 ### Limitations
 
@@ -616,13 +823,13 @@ This is more expressive than a loosely coupled design where UWB would first be c
 - vertical observability may remain weak
 - gravity-based initialization assumes a near-static startup
 - bias/noise tuning remains important for stable performance
-- WLS normal equations are unweighted in the current implementation despite the class name
+- the current integrity covariance model is diagonal at the TDOA-pair level and does not yet include shared-anchor correlations
 
-That last point is worth noting: the solver is called `TdoaWlsSolver`, but the current code effectively performs Gauss-Newton least squares without per-measurement weighting. The robust weighting is applied in the graph back-end, not in the standalone WLS front-end.
+The covariance limitation is worth noting: the next mathematical improvement is to pass per-anchor range sigmas into the integrity monitor and construct the full correlated covariance `C = D Sigma_anchor D^T`.
 
 ---
 
-## 15. Summary
+## 16. Summary
 
 This codebase implements a practical UWB-IMU fusion pipeline with two complementary estimators:
 
@@ -633,6 +840,8 @@ Technically, the key methods are:
 
 - nonlinear least squares for TDOA localization
 - custom factor-graph modeling of TDOA
+- dynamic per-TDOA WLS weighting
+- RAIM-style integrity monitoring with HPL/VPL and FDE
 - IMU preintegration
 - incremental smoothing with iSAM2
 - soft priors and innovation gating for stability

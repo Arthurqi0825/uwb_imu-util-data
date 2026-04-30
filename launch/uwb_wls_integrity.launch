@@ -36,17 +36,32 @@
   <arg name="lc_update_bias_sigma" default="0.5"/>
 
   <!-- Integrity monitoring -->
-  <!-- Set to 2× tdoa_noise_sigma from config for the per-pair (2σ²) model  -->
-  <arg name="integrity_tdoa_noise_sigma" default="1.0"/>
+  <!-- Per-anchor ranging noise floor [m].
+       Calibrate from static measurements: sigma_single ≈ 0.03–0.08 m for UWB LOS.
+       This value enters the monitor as sqrt(2)*sigma for the fallback diagonal path,
+       and as 'base' in the dynamic model: sigma_i = base + slope * range_i.        -->
+  <arg name="integrity_tdoa_noise_sigma" default="0.05"/>
   <arg name="integrity_p_fa"             default="0.001"/>
   <arg name="integrity_hal"              default="1.0"/>   <!-- [m] horiz alert limit -->
   <arg name="integrity_val"              default="2.0"/>   <!-- [m] vert  alert limit -->
-  <arg name="integrity_ring_threshold"   default="1.0"/>   <!-- [m] ring-closure alarm -->
+  <arg name="integrity_ring_threshold"   default="0.10"/>   <!-- [m] ring-closure alarm -->
   <arg name="integrity_enable_fde"       default="true"/>
+  <arg name="dynamic_tdoa_sigma_enabled" default="true"/>
+  <!-- sigma_pair = sqrt(sigma_A² + sigma_B²)
+       sigma_i    = base + slope * range_i
+       base  = hardware noise floor (same as integrity_tdoa_noise_sigma above)
+       slope = range-dependent growth: 0.005 m per metre → +0.04 m at 8 m range
+       At 8 m:  sigma_i ≈ 0.05 + 0.005*8 = 0.09 m
+                sigma_pair ≈ sqrt(2)*0.09 ≈ 0.127 m  →  HPL ≈ 0.43 m  (was 5.1 m)
+       max   = hard cap; prevents HPL blow-up on distant / NLOS anchors           -->
+  <arg name="tdoa_range_sigma_base"      default="$(arg integrity_tdoa_noise_sigma)"/>
+  <arg name="tdoa_range_sigma_per_meter" default="0.005"/>
+  <arg name="tdoa_pair_sigma_min"        default="0.001"/>
+  <arg name="tdoa_pair_sigma_max"        default="0.50"/>
 
   <!-- Trajectory CSV log output path -->
   <arg name="trajectory_log_path"
-       default="/tmp/uwb_imu_trajectory_integrity.csv"/>
+       default="$(find uwb_imu_fusion)/output/uwb_wls_integrity_dynamic_weight_trajectory.csv"/>
 
   <rosparam ns="uwb_imu_fusion"
             file="$(arg config_file)"
@@ -55,7 +70,7 @@
   <!-- ═══════════════════════════════════════════════════════════════════════
        FUSION NODE
        ═══════════════════════════════════════════════════════════════════════ -->
-  <node name="integrity_uwb_node"
+  <node name="uwb_wls_integrity_node"
         pkg="uwb_imu_fusion"
         type="integrity_uwb_node"
         output="screen"
@@ -103,6 +118,11 @@
     <param name="integrity_val"              value="$(arg integrity_val)"              type="double"/>
     <param name="integrity_ring_threshold"   value="$(arg integrity_ring_threshold)"   type="double"/>
     <param name="integrity_enable_fde"       value="$(arg integrity_enable_fde)"       type="bool"/>
+    <param name="dynamic_tdoa_sigma_enabled" value="$(arg dynamic_tdoa_sigma_enabled)" type="bool"/>
+    <param name="tdoa_range_sigma_base"      value="$(arg tdoa_range_sigma_base)"      type="double"/>
+    <param name="tdoa_range_sigma_per_meter" value="$(arg tdoa_range_sigma_per_meter)" type="double"/>
+    <param name="tdoa_pair_sigma_min"        value="$(arg tdoa_pair_sigma_min)"        type="double"/>
+    <param name="tdoa_pair_sigma_max"        value="$(arg tdoa_pair_sigma_max)"        type="double"/>
 
     <!-- ── Logging ────────────────────────────────────────────────────── -->
     <param name="trajectory_log_path" value="$(arg trajectory_log_path)" type="str"/>

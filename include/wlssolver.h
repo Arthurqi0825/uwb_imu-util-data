@@ -13,6 +13,8 @@
 //   TdoaWlsSolver solver(50, 1e-7);  // max_iter=50, tol=1e-7 m
 //   Eigen::Vector3d p = initial_guess;
 //   bool ok = solver.solve(measurements, anchors, p);
+//   // Optional weighted refinement:
+//   // bool ok_w = solver.solveWeighted(measurements, anchors, sigmas, p);
 //   // p holds the solution if ok == true
 //
 // THREAD SAFETY:
@@ -85,7 +87,23 @@ class TdoaWlsSolver {
   bool solve(const std::vector<TdoaMeas>&      meas,
              const std::vector<gtsam::Point3>& anchors,
              Eigen::Vector3d&                  p) const {
+    return solveWeighted(meas, anchors, Eigen::VectorXd(), p);
+  }
+
+  // ---------------------------------------------------------------------------
+  // solveWeighted()
+  //
+  // Same Gauss-Newton solver, but with per-measurement sigmas. If sigma.size()
+  // does not match meas.size(), this falls back to unit weights.
+  // ---------------------------------------------------------------------------
+  bool solveWeighted(const std::vector<TdoaMeas>&      meas,
+                     const std::vector<gtsam::Point3>& anchors,
+                     const Eigen::VectorXd&            sigma,
+                     Eigen::Vector3d&                  p) const {
     if (static_cast<int>(meas.size()) < kMinMeasurements) return false;
+
+    const bool use_weights =
+        (sigma.size() == static_cast<int>(meas.size()));
 
     for (int iter = 0; iter < max_iter_; ++iter) {
       const int n = static_cast<int>(meas.size());
@@ -93,6 +111,7 @@ class TdoaWlsSolver {
       // Build the Jacobian J (n×3) and residual vector r (n×1).
       Eigen::MatrixXd J(n, 3);
       Eigen::VectorXd r(n);
+      Eigen::VectorXd w = Eigen::VectorXd::Ones(n);
 
       for (int i = 0; i < n; ++i) {
         const auto& m = meas[i];
@@ -114,11 +133,18 @@ class TdoaWlsSolver {
         // Residual: r(i) = (||p-aB|| - ||p-aA||) - tdoa_measured
         r(i)     = (rB - rA) - m.tdoa;
         J.row(i) = (dB / rB - dA / rA).transpose();
+
+        if (use_weights) {
+          const double s = std::max(sigma(i), kMinDist);
+          w(i) = 1.0 / (s * s);
+        }
       }
 
-      // Normal equations: (JᵀJ) dp = -Jᵀr
+      // Weighted normal equations: (JᵀWJ) dp = -JᵀWr
+      const Eigen::Matrix3d JT_W_J = J.transpose() * w.asDiagonal() * J;
+      const Eigen::Vector3d JT_W_r = J.transpose() * (w.asDiagonal() * r);
       const Eigen::Vector3d dp =
-          -(J.transpose() * J).ldlt().solve(J.transpose() * r);
+          -JT_W_J.ldlt().solve(JT_W_r);
       p += dp;
 
       if (dp.norm() < tol_) {

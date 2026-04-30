@@ -19,7 +19,7 @@
 
     <!-- Log path -->
     <arg name="trajectory_log_path"
-         default="$(find uwb_imu_fusion)/output/uwb_imu_trajectory_tc_260429.csv" />
+         default="$(find uwb_imu_fusion)/output/uwb_imu_trajectory_tc_260430.csv" />
     <arg name="imu_log_path"
          default="$(find uwb_imu_fusion)/output/uwb_imu_raw_imu.csv" />
 
