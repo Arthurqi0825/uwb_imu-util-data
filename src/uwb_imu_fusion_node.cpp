@@ -102,6 +102,12 @@ namespace uwb_imu_fusion
     gtsam::Vector3 gyr; // [rad/s] — already converted from deg/s if needed
   };
 
+  struct GtMeas
+  {
+    double t;
+    gtsam::Point3 p;
+  };
+
   struct FgoState
   {
     gtsam::Pose3 pose;
@@ -248,11 +254,11 @@ namespace uwb_imu_fusion
       //                                      must converge from zero
       //   tc_gyro_bias_rw_sigma  0.0003      gyro bias is small and stable
       // ---------------------------------------------------------------------------
-      get("tc_accel_noise_sigma", tc_accel_sigma_, 0.04);             // measured ~0.04 m/s²
-      get("tc_gyro_noise_sigma", tc_gyro_sigma_, 0.003);              // measured ~0.0025 rad/s
-      get("tc_accel_bias_rw_sigma", tc_accel_bias_rw_sigma_, 0.01);   // real accel bias ~0.22 m/s²
-      get("tc_gyro_bias_rw_sigma", tc_gyro_bias_rw_sigma_, 0.0003);   // gyro bias stable
-      get("tc_integration_noise_sigma", tc_integration_sigma_, 1e-4); // raised: ~974 Hz IMU, many integration steps
+      get("tc_accel_noise_sigma", tc_accel_sigma_, 0.08);             // lower IMU weight than measured floor
+      get("tc_gyro_noise_sigma", tc_gyro_sigma_, 0.006);              // lower IMU attitude authority
+      get("tc_accel_bias_rw_sigma", tc_accel_bias_rw_sigma_, 0.02);   // allow accel bias to absorb IMU mismatch
+      get("tc_gyro_bias_rw_sigma", tc_gyro_bias_rw_sigma_, 0.0006);   // allow gyro bias to adapt
+      get("tc_integration_noise_sigma", tc_integration_sigma_, 5e-4); // lower long-window IMU confidence
 
       // ---------------------------------------------------------------------------
       // UWB / TC measurement noise
@@ -269,15 +275,26 @@ namespace uwb_imu_fusion
       //   XY = 0.25 m (confident), Z = 0.35 m (WLS Z noisier due to poor
       //   vertical anchor geometry → slightly looser to avoid vertical lock).
       // ---------------------------------------------------------------------------
-      get("tdoa_sigma", tdoa_sigma_, 0.3); // balanced: was 0.15 (too tight → NLOS jumps)
+      get("tdoa_sigma", tdoa_sigma_, 0.2); // higher UWB weight; residual gate handles large NLOS spikes
       get("use_robust_noise", use_robust_noise_, true);
       get("huber_k", huber_k_, 1.345);
+      get("use_dynamic_tdoa_sigma", use_dynamic_tdoa_sigma_, true);
+      get("tdoa_sigma_min", tdoa_sigma_min_, 0.05);
+      get("tdoa_sigma_max", tdoa_sigma_max_, 0.8);
+      get("tdoa_residual_sigma_scale", tdoa_residual_sigma_scale_, 0.75);
+      get("wls_refine_with_dynamic_sigma", wls_refine_with_dynamic_sigma_, true);
       get("cycle_timeout", cycle_timeout_, 0.1);
-      int mpc = 8, min_imu = 2;
+      int mpc = 8, min_cycle = 6, min_imu = 2;
       get("measurements_per_cycle", mpc, 8);
+      get("min_cycle_measurements", min_cycle, 6);
       get("min_imu_per_cycle", min_imu, 2);
       measurements_per_cycle_ = mpc;
+      min_cycle_measurements_ = std::min(std::max(min_cycle, 3), measurements_per_cycle_);
       min_imu_per_cycle_ = min_imu;
+      get("tc_use_tdoa_residual_gate", tc_use_tdoa_residual_gate_, true);
+      get("tc_tdoa_residual_gate", tc_tdoa_residual_gate_, 0.9);
+      get("tc_min_tdoa_factors", tc_min_tdoa_factors_, 4);
+      tc_min_tdoa_factors_ = std::min(std::max(tc_min_tdoa_factors_, 3), measurements_per_cycle_);
 
       // ---------------------------------------------------------------------------
       // TC priors
@@ -298,27 +315,31 @@ namespace uwb_imu_fusion
       //
       // tc_update_bias_sigma  Moderate: bias can evolve slowly between updates.
       // ---------------------------------------------------------------------------
-      std::vector<double> tc_pps{0.5, 0.5, 0.5, 0.05, 0.05, 0.05};
+      std::vector<double> tc_pps{0.5, 0.5, 0.5, 0.05, 0.05, 0.20};
       if (!nh_.getParam("/uwb_imu_fusion/tc_prior_pose_sigmas", tc_pps))
         pnh_.getParam("tc_prior_pose_sigmas", tc_pps);
       tc_prior_pose_sigmas_ = gtsam::Vector6::Map(tc_pps.data());
       get("tc_prior_vel_sigma", tc_prior_vel_sigma_, 0.1);
       get("tc_prior_bias_sigma", tc_prior_bias_sigma_, 0.1); // FIX: was 0.001 — too tight, froze bias at zero
-      get("tc_update_vel_sigma", tc_update_vel_sigma_, 0.5); // FIX: was 2.0 — too loose, velocity drifts
-      get("tc_update_bias_sigma", tc_update_bias_sigma_, 0.1);
+      get("tc_update_vel_sigma", tc_update_vel_sigma_, 0.8); // looser: reduce IMU-predicted velocity authority
+      get("tc_update_bias_sigma", tc_update_bias_sigma_, 0.2);
+      get("tc_use_wls_velocity_prior", tc_use_wls_velocity_prior_, true);
+      get("tc_wls_velocity_sigma", tc_wls_velocity_sigma_, 0.15);
+      get("tc_wls_velocity_max_speed", tc_wls_velocity_max_speed_, 1.2);
+      get("tc_wls_velocity_max_dt", tc_wls_velocity_max_dt_, 0.25);
       get("tc_use_vertical_prior", tc_use_vertical_prior_, true);
-      get("tc_vertical_prior_sigma", tc_vertical_prior_sigma_, 0.2);
+      get("tc_vertical_prior_sigma", tc_vertical_prior_sigma_, 0.15);
 
       // WLS position prior sigmas
       //   XY: 0.25 m — WLS proven accurate in horizontal plane
       //   Z:  0.35 m — WLS Z is noisier (poor vertical anchor geometry);
       //               looser Z avoids vertical locking to a biased WLS height
       get("tc_use_wls_position_prior", tc_use_wls_position_prior_, true);
-      get("tc_wls_xy_sigma", tc_wls_xy_sigma_, 0.25); // balanced: was 0.15 (too tight → NLOS jumps)
-      get("tc_wls_z_sigma", tc_wls_z_sigma_, 0.35);   // looser Z: WLS Z less reliable
-      get("tc_wls_rescue_gate", tc_wls_rescue_gate_, 0.25);
-      get("tc_wls_rescue_xy_sigma", tc_wls_rescue_xy_sigma_, 0.08);
-      get("tc_wls_rescue_z_sigma", tc_wls_rescue_z_sigma_, 0.25);
+      get("tc_wls_xy_sigma", tc_wls_xy_sigma_, 0.10); // WLS target error is <0.1 m
+      get("tc_wls_z_sigma", tc_wls_z_sigma_, 0.18);   // still looser than XY due to vertical geometry
+      get("tc_wls_rescue_gate", tc_wls_rescue_gate_, 0.20);
+      get("tc_wls_rescue_xy_sigma", tc_wls_rescue_xy_sigma_, 0.04);
+      get("tc_wls_rescue_z_sigma", tc_wls_rescue_z_sigma_, 0.12);
 
       // ---------------------------------------------------------------------------
       // TC attitude stabilization
@@ -350,8 +371,8 @@ namespace uwb_imu_fusion
       //   drifted TC state from being anchored to a WLS point that is far from
       //   the linearisation point, which destabilises the graph.
       // ---------------------------------------------------------------------------
-      get("tc_wls_dropout_xy_sigma", tc_wls_dropout_xy_sigma_, 0.40); // softer: no IMU orientation
-      get("tc_dropout_vel_sigma", tc_dropout_vel_sigma_, 0.1);        // tight: stop phantom drift
+      get("tc_wls_dropout_xy_sigma", tc_wls_dropout_xy_sigma_, 0.25); // more UWB pull during IMU gaps
+      get("tc_dropout_vel_sigma", tc_dropout_vel_sigma_, 0.2);        // lower stale-IMU velocity authority
       get("wls_innovation_gate", wls_innovation_gate_, 0.8);          // reject WLS >0.8m from pred
 
       // Initial pose
@@ -368,6 +389,7 @@ namespace uwb_imu_fusion
 
       get("odom_frame", odom_frame_, std::string("map"));
       get("base_frame", base_frame_, std::string("base_link"));
+      get("gt_match_max_dt", gt_match_max_dt_, 0.02);
       get("trajectory_log_path", traj_log_path_,
           std::string("/tmp/uwb_imu_trajectory.csv"));
       get("imu_log_path", imu_log_path_,
@@ -529,14 +551,16 @@ namespace uwb_imu_fusion
       Eigen::Quaterniond tq = tc_.initialized
                                   ? Eigen::Quaterniond(tc_.pose.rotation().matrix())
                                   : Eigen::Quaterniond(nan, nan, nan, nan);
-      Eigen::Vector3d gt_e(gt_pos_.x(), gt_pos_.y(), gt_pos_.z());
+      gtsam::Point3 gt_at_t;
+      const bool gt_at_t_ok = getGroundTruthAt(t, gt_at_t);
+      Eigen::Vector3d gt_e(gt_at_t.x(), gt_at_t.y(), gt_at_t.z());
 
       traj_log_ << std::fixed << std::setprecision(6)
                 << t << ","
                 // ground truth
-                << (gt_have_ ? gt_pos_.x() : nan) << ","
-                << (gt_have_ ? gt_pos_.y() : nan) << ","
-                << (gt_have_ ? gt_pos_.z() : nan) << ","
+                << (gt_at_t_ok ? gt_at_t.x() : nan) << ","
+                << (gt_at_t_ok ? gt_at_t.y() : nan) << ","
+                << (gt_at_t_ok ? gt_at_t.z() : nan) << ","
                 // WLS position
                 << (wls_ok ? wls_p.x() : nan) << ","
                 << (wls_ok ? wls_p.y() : nan) << ","
@@ -561,8 +585,8 @@ namespace uwb_imu_fusion
                 << imu_stats.mean_accel_norm << ","
                 << imu_stats.mean_gyro_norm << ","
                 // errors
-                << (wls_ok && gt_have_ ? (wls_p - gt_e).norm() : nan) << ","
-                << (tc_.initialized && gt_have_ ? (tp - gt_e).norm() : nan) << "\n";
+                << (wls_ok && gt_at_t_ok ? (wls_p - gt_e).norm() : nan) << ","
+                << (tc_.initialized && gt_at_t_ok ? (tp - gt_e).norm() : nan) << "\n";
       traj_log_.flush();
     }
 
@@ -705,14 +729,14 @@ namespace uwb_imu_fusion
       if (!current_cycle_.empty() &&
           (ts.t - current_cycle_.front().t) > cycle_timeout_)
       {
+        processCurrentCycleIfReady();
         current_cycle_.clear();
         cycle_pairs_.clear();
       }
       auto pr = std::make_pair(std::min(ts.idA, ts.idB), std::max(ts.idA, ts.idB));
       if (cycle_pairs_.count(pr))
       {
-        if ((int)current_cycle_.size() >= measurements_per_cycle_)
-          processCycle(current_cycle_);
+        processCurrentCycleIfReady();
         current_cycle_.clear();
         cycle_pairs_.clear();
       }
@@ -726,16 +750,43 @@ namespace uwb_imu_fusion
       }
     }
 
+    void processCurrentCycleIfReady()
+    {
+      if ((int)current_cycle_.size() >= min_cycle_measurements_)
+      {
+        processCycle(current_cycle_);
+      }
+      else if (!current_cycle_.empty())
+      {
+        ROS_WARN_THROTTLE(1.0,
+                          "[uwb_imu_fusion] Dropping short UWB cycle: %zu measurements < min=%d",
+                          current_cycle_.size(), min_cycle_measurements_);
+      }
+    }
+
     // ===========================================================================
     // GT CALLBACK
     // ===========================================================================
     void gtCallback(const geometry_msgs::PoseWithCovarianceStamped::ConstPtr &msg)
     {
       std::lock_guard<std::mutex> lk(mutex_);
+      const double t = msg->header.stamp.toSec();
       gt_pos_ = gtsam::Point3(msg->pose.pose.position.x,
                               msg->pose.pose.position.y,
                               msg->pose.pose.position.z);
       gt_have_ = true;
+      if (gt_buf_.empty() || t > gt_buf_.back().t)
+      {
+        gt_buf_.push_back(GtMeas{t, gt_pos_});
+      }
+      else
+      {
+        ROS_WARN_THROTTLE(1.0, "[uwb_imu_fusion] GT out-of-order %.6f", t);
+      }
+      const double keep_after = (tc_.initialized ? tc_.last_cycle_t : t) - 5.0;
+      while (gt_buf_.size() > 2 && gt_buf_.front().t < keep_after)
+        gt_buf_.pop_front();
+
       geometry_msgs::PoseStamped ps;
       ps.header = msg->header;
       ps.header.frame_id = odom_frame_;
@@ -744,6 +795,55 @@ namespace uwb_imu_fusion
       gt_path_.header.frame_id = odom_frame_;
       gt_path_.poses.push_back(ps);
       gt_path_pub_.publish(gt_path_);
+    }
+
+    bool getGroundTruthAt(double t, gtsam::Point3 &gt) const
+    {
+      if (gt_buf_.empty())
+        return false;
+
+      if (gt_buf_.size() == 1)
+      {
+        if (std::fabs(gt_buf_.front().t - t) <= gt_match_max_dt_)
+        {
+          gt = gt_buf_.front().p;
+          return true;
+        }
+        return false;
+      }
+
+      for (size_t i = 1; i < gt_buf_.size(); ++i)
+      {
+        const auto &a = gt_buf_[i - 1];
+        const auto &b = gt_buf_[i];
+        if (t < a.t)
+          break;
+        if (t <= b.t)
+        {
+          const double dt = b.t - a.t;
+          if (dt <= 1e-9)
+          {
+            gt = b.p;
+            return true;
+          }
+          const double u = (t - a.t) / dt;
+          gt = gtsam::Point3(a.p.x() + u * (b.p.x() - a.p.x()),
+                             a.p.y() + u * (b.p.y() - a.p.y()),
+                             a.p.z() + u * (b.p.z() - a.p.z()));
+          return true;
+        }
+      }
+
+      const auto &front = gt_buf_.front();
+      const auto &back = gt_buf_.back();
+      const double front_dt = std::fabs(t - front.t);
+      const double back_dt = std::fabs(t - back.t);
+      if (std::min(front_dt, back_dt) <= gt_match_max_dt_)
+      {
+        gt = (front_dt <= back_dt) ? front.p : back.p;
+        return true;
+      }
+      return false;
     }
 
     // ===========================================================================
@@ -765,20 +865,39 @@ namespace uwb_imu_fusion
       // WLS
       Eigen::Vector3d wls_p = wls_guess_;
       bool wls_ok = wls_solver_.solve(meas, anchors_, wls_p);
+      Eigen::VectorXd tdoa_sigmas;
+      if (wls_ok)
+      {
+        tdoa_sigmas = computeDynamicTdoaSigmas(meas, wls_p);
+        if (wls_refine_with_dynamic_sigma_ && tdoa_sigmas.size() == static_cast<int>(meas.size()))
+        {
+          Eigen::Vector3d weighted_wls_p = wls_p;
+          if (wls_solver_.solveWeighted(meas, anchors_, tdoa_sigmas, weighted_wls_p))
+          {
+            wls_p = weighted_wls_p;
+            tdoa_sigmas = computeDynamicTdoaSigmas(meas, wls_p);
+          }
+        }
+      }
       if (wls_ok)
         wls_guess_ = wls_p;
       ROS_WARN("[WLS Solution] t=%.3f  x=%.3f  y=%.3f  z=%.3f",
                t_mid, wls_p.x(), wls_p.y(), wls_p.z());
 
       // ── TC: raw TDOA + IMU ─────────────────────────────────────────────────
+      const std::vector<TdoaMeas> tc_meas = selectTcTdoaMeasurements(meas, wls_ok, wls_p);
+      const Eigen::VectorXd tc_tdoa_sigmas = wls_ok ? computeDynamicTdoaSigmas(tc_meas, wls_p)
+                                                    : Eigen::VectorXd();
+
       if (!tc_.initialized)
       {
-        tcInitGraph(t_mid, meas, wls_ok, wls_p);
+        tcInitGraph(t_mid, tc_meas, tc_tdoa_sigmas, wls_ok, wls_p);
       }
       else
       {
-        tcUpdateGraph(t_mid, meas, wls_ok, wls_p);
+        tcUpdateGraph(t_mid, tc_meas, tc_tdoa_sigmas, wls_ok, wls_p);
       }
+      rememberWlsSample(t_mid, wls_ok, wls_p);
 
       // Console
       printCycleInfo(t_mid, wls_ok, wls_p);
@@ -1020,6 +1139,138 @@ namespace uwb_imu_fusion
       return true;
     }
 
+    void rememberWlsSample(double t_mid, bool wls_ok, const Eigen::Vector3d &wls_p)
+    {
+      if (!wls_ok)
+        return;
+      last_wls_p_ = wls_p;
+      last_wls_t_ = t_mid;
+      have_last_wls_ = true;
+    }
+
+    bool computeWlsVelocityReference(double t_mid,
+                                     const Eigen::Vector3d &wls_p,
+                                     gtsam::Vector3 &vel_ref) const
+    {
+      if (!tc_use_wls_velocity_prior_ || !have_last_wls_)
+        return false;
+
+      const double dt = t_mid - last_wls_t_;
+      if (dt <= 1e-3 || dt > tc_wls_velocity_max_dt_)
+        return false;
+
+      Eigen::Vector3d v = (wls_p - last_wls_p_) / dt;
+      v.z() = 0.0; // WLS Z finite differences are too noisy for velocity priors.
+      const double speed = v.norm();
+      if (speed > tc_wls_velocity_max_speed_)
+        v *= tc_wls_velocity_max_speed_ / speed;
+
+      vel_ref = gtsam::Vector3(v.x(), v.y(), v.z());
+      return true;
+    }
+
+    double tdoaResidualAt(const TdoaMeas &m, const Eigen::Vector3d &p) const
+    {
+      const Eigen::Vector3d aA(anchors_[m.idA].x(),
+                               anchors_[m.idA].y(),
+                               anchors_[m.idA].z());
+      const Eigen::Vector3d aB(anchors_[m.idB].x(),
+                               anchors_[m.idB].y(),
+                               anchors_[m.idB].z());
+      const double dA = (p - aA).norm();
+      const double dB = (p - aB).norm();
+      return (dB - dA) - m.tdoa;
+    }
+
+    double dynamicTdoaSigmaFromResidual(double abs_residual) const
+    {
+      if (!use_dynamic_tdoa_sigma_)
+        return tdoa_sigma_;
+      const double sigma = tdoa_sigma_min_ + tdoa_residual_sigma_scale_ * abs_residual;
+      return std::min(std::max(sigma, tdoa_sigma_min_), tdoa_sigma_max_);
+    }
+
+    Eigen::VectorXd computeDynamicTdoaSigmas(const std::vector<TdoaMeas> &meas,
+                                             const Eigen::Vector3d &wls_p) const
+    {
+      Eigen::VectorXd sigmas(meas.size());
+      for (size_t i = 0; i < meas.size(); ++i)
+      {
+        sigmas(static_cast<int>(i)) =
+            dynamicTdoaSigmaFromResidual(std::fabs(tdoaResidualAt(meas[i], wls_p)));
+      }
+      return sigmas;
+    }
+
+    gtsam::SharedNoiseModel makeTdoaNoise(double sigma) const
+    {
+      const double bounded_sigma = std::min(std::max(sigma, tdoa_sigma_min_), tdoa_sigma_max_);
+      gtsam::SharedNoiseModel base =
+          gtsam::noiseModel::Isotropic::Sigma(1, bounded_sigma);
+      if (use_robust_noise_)
+      {
+        return gtsam::noiseModel::Robust::Create(
+            gtsam::noiseModel::mEstimator::Huber::Create(huber_k_), base);
+      }
+      return base;
+    }
+
+    void addTcTdoaFactors(gtsam::NonlinearFactorGraph &graph,
+                          size_t k,
+                          const std::vector<TdoaMeas> &meas,
+                          const Eigen::VectorXd &sigmas) const
+    {
+      for (size_t i = 0; i < meas.size(); ++i)
+      {
+        const auto &m = meas[i];
+        const double sigma =
+            (sigmas.size() == static_cast<int>(meas.size()))
+                ? sigmas(static_cast<int>(i))
+                : tdoa_sigma_;
+        graph.add(TdoaFactor(X(k), anchors_[m.idA], anchors_[m.idB],
+                             -m.tdoa, makeTdoaNoise(sigma)));
+      }
+    }
+
+    std::vector<TdoaMeas> selectTcTdoaMeasurements(const std::vector<TdoaMeas> &meas,
+                                                   bool wls_ok,
+                                                   const Eigen::Vector3d &wls_p) const
+    {
+      if (!tc_use_tdoa_residual_gate_ || !wls_ok ||
+          tc_tdoa_residual_gate_ <= 0.0 ||
+          static_cast<int>(meas.size()) <= tc_min_tdoa_factors_)
+      {
+        return meas;
+      }
+
+      std::vector<TdoaMeas> kept;
+      kept.reserve(meas.size());
+      double max_abs_residual = 0.0;
+      for (const auto &m : meas)
+      {
+        const double abs_r = std::fabs(tdoaResidualAt(m, wls_p));
+        max_abs_residual = std::max(max_abs_residual, abs_r);
+        if (abs_r <= tc_tdoa_residual_gate_)
+          kept.push_back(m);
+      }
+
+      if (static_cast<int>(kept.size()) < tc_min_tdoa_factors_)
+      {
+        ROS_WARN_THROTTLE(0.5,
+                          "[TC-FGO] TDOA residual gate skipped: would keep %zu/%zu (< min=%d), max|r|=%.3f m",
+                          kept.size(), meas.size(), tc_min_tdoa_factors_, max_abs_residual);
+        return meas;
+      }
+
+      if (kept.size() != meas.size())
+      {
+        ROS_WARN_THROTTLE(0.5,
+                          "[TC-FGO] TDOA residual gate kept %zu/%zu measurements (gate=%.3f m, max|r|=%.3f m)",
+                          kept.size(), meas.size(), tc_tdoa_residual_gate_, max_abs_residual);
+      }
+      return kept;
+    }
+
     // ===========================================================================
     // TC-FGO DROPOUT UPDATE
     //
@@ -1034,6 +1285,7 @@ namespace uwb_imu_fusion
     // while the vehicle is moving at ~1 m/s.
     // ===========================================================================
     void tcDropoutUpdate(double t_mid, const std::vector<TdoaMeas> &meas,
+                         const Eigen::VectorXd &tdoa_sigmas,
                          bool wls_ok, const Eigen::Vector3d &wls_p)
     {
       if (!wls_ok)
@@ -1059,13 +1311,21 @@ namespace uwb_imu_fusion
         addTcWlsPositionPriorDropout(graph, k, wls_p);
       addTcAttitudePrior(graph, k, tc_.pose.translation());
 
-      // ── Velocity: tight prior pulling toward current estimate ─────────────────
-      // During a dropout the last velocity is stale.  We damp it toward the
-      // current value with a tight sigma to stop phantom integration.
-      // Use the current tc_.vel as the prior mean (not zero) so we don't
-      // violently brake a fast-moving vehicle — just prevent further growth.
-      graph.addPrior(V(k), tc_.vel,
-                     gtsam::noiseModel::Isotropic::Sigma(3, tc_dropout_vel_sigma_));
+      // ── Velocity: prefer WLS XY displacement over stale TC XY velocity.
+      gtsam::Vector3 dropout_vel_ref = tc_.vel;
+      gtsam::Vector3 dropout_vel_sig = gtsam::Vector3::Constant(tc_dropout_vel_sigma_);
+      if (wls_gated)
+      {
+        gtsam::Vector3 wls_vel_ref;
+        if (computeWlsVelocityReference(t_mid, wls_p, wls_vel_ref))
+        {
+          dropout_vel_ref.x() = wls_vel_ref.x();
+          dropout_vel_ref.y() = wls_vel_ref.y();
+          dropout_vel_sig.z() = tc_update_vel_sigma_;
+        }
+      }
+      graph.addPrior(V(k), dropout_vel_ref,
+                     gtsam::noiseModel::Diagonal::Sigmas(dropout_vel_sig));
 
       // ── Bias: carry forward — no IMU means bias cannot update, just hold ─────
       graph.add(tcBiasBetween(k_pre, k, t_mid - tc_.last_cycle_t));
@@ -1080,9 +1340,7 @@ namespace uwb_imu_fusion
         addTcVerticalPrior(graph, k, pos_hint, pos_hint.z());
 
       // ── TDOA factors ──────────────────────────────────────────────────────────
-      for (const auto &m : meas)
-        graph.add(TdoaFactor(X(k), anchors_[m.idA], anchors_[m.idB],
-                             -m.tdoa, tdoa_noise_));
+      addTcTdoaFactors(graph, k, meas, tdoa_sigmas);
 
       // Initial value: hold current pose (no IMU prediction)
       values.insert(X(k), tc_.pose);
@@ -1116,6 +1374,7 @@ namespace uwb_imu_fusion
     }
 
     void tcInitGraph(double t_mid, const std::vector<TdoaMeas> &meas,
+                     const Eigen::VectorXd &tdoa_sigmas,
                      bool wls_ok, const Eigen::Vector3d &wls_p)
     {
       tc_.cycle_idx = 0;
@@ -1149,9 +1408,7 @@ namespace uwb_imu_fusion
       if (wls_ok)
         addTcVerticalPrior(graph, 0, tc_.pose.translation(), wls_p.z());
 
-      for (const auto &m : meas)
-        graph.add(TdoaFactor(X(0), anchors_[m.idA], anchors_[m.idB],
-                             -m.tdoa, tdoa_noise_));
+      addTcTdoaFactors(graph, 0, meas, tdoa_sigmas);
 
       values.insert(X(0), tc_.pose);
       values.insert(V(0), tc_.vel);
@@ -1179,6 +1436,7 @@ namespace uwb_imu_fusion
     // Per keyframe k: ImuFactor + BiasBetween + TdoaFactor × N
     // ===========================================================================
     void tcUpdateGraph(double t_mid, const std::vector<TdoaMeas> &meas,
+                       const Eigen::VectorXd &tdoa_sigmas,
                        bool wls_ok, const Eigen::Vector3d &wls_p)
     {
       tc_preint_->resetIntegrationAndSetBias(tc_.bias);
@@ -1189,7 +1447,7 @@ namespace uwb_imu_fusion
         // IMU dropout — route to dedicated dropout handler instead of skipping.
         // Skipping leaves velocity frozen and position unanchored, which causes
         // phantom drift of speed×gap_duration (observed: up to 0.83 m per gap).
-        tcDropoutUpdate(t_mid, meas, wls_ok, wls_p);
+        tcDropoutUpdate(t_mid, meas, tdoa_sigmas, wls_ok, wls_p);
         return;
       }
 
@@ -1207,17 +1465,39 @@ namespace uwb_imu_fusion
           X(k_pre), V(k_pre), X(k), V(k), B(k_pre), *tc_preint_));
       graph.add(tcBiasBetween(k_pre, k, t_mid - tc_.last_cycle_t));
 
-      graph.addPrior(V(k), pred_nav.velocity(),
-                     gtsam::noiseModel::Isotropic::Sigma(3, tc_update_vel_sigma_));
+      // Apply WLS innovation gate before adding WLS-derived priors.
+      // When TC has drifted far from WLS (e.g. after a dropout), adding tight
+      // WLS constraints against a badly linearised point can amplify the error
+      // rather than correcting it.
+      const bool wls_gated = wls_ok && wlsPassesInnovationGate(wls_p);
+
+      gtsam::Vector3 vel_prior_mean = pred_nav.velocity();
+      double vel_prior_sigma = tc_update_vel_sigma_;
+      bool using_wls_vel_prior = false;
+
+      gtsam::Vector3 wls_vel_ref;
+      if (wls_gated && computeWlsVelocityReference(t_mid, wls_p, wls_vel_ref))
+      {
+        vel_prior_mean.x() = wls_vel_ref.x();
+        vel_prior_mean.y() = wls_vel_ref.y();
+        vel_prior_sigma = tc_wls_velocity_sigma_;
+        using_wls_vel_prior = true;
+      }
+
+      gtsam::Vector3 vel_prior_sig;
+      vel_prior_sig << vel_prior_sigma, vel_prior_sigma, tc_update_vel_sigma_;
+      graph.addPrior(V(k), vel_prior_mean,
+                     gtsam::noiseModel::Diagonal::Sigmas(vel_prior_sig));
+      if (using_wls_vel_prior)
+      {
+        ROS_WARN_THROTTLE(0.5,
+                          "[TC-FGO] WLS XY velocity prior active: v_xy=[%.3f,%.3f] sigma_xy=%.3f sigma_z=%.3f",
+                          vel_prior_mean.x(), vel_prior_mean.y(),
+                          vel_prior_sigma, tc_update_vel_sigma_);
+      }
       graph.addPrior(B(k), tc_.bias,
                      gtsam::noiseModel::Isotropic::Sigma(6, tc_update_bias_sigma_));
 
-      // Apply WLS innovation gate before adding position prior.
-      // When TC has drifted far from WLS (e.g. after a dropout), adding a tight
-      // WLS prior against a badly linearised point amplifies the error rather
-      // than correcting it.  The gate rejects the prior when the XY gap exceeds
-      // wls_innovation_gate_, letting TDOA factors pull TC back gradually.
-      const bool wls_gated = wls_ok && wlsPassesInnovationGate(wls_p);
       if (wls_gated)
       {
         if (wlsNeedsRescuePrior(wls_p))
@@ -1244,9 +1524,7 @@ namespace uwb_imu_fusion
       }
       addTcAttitudePrior(graph, k, pred_nav.pose().translation());
 
-      for (const auto &m : meas)
-        graph.add(TdoaFactor(X(k), anchors_[m.idA], anchors_[m.idB],
-                             -m.tdoa, tdoa_noise_));
+      addTcTdoaFactors(graph, k, meas, tdoa_sigmas);
 
       values.insert(X(k), pred_nav.pose());
       values.insert(V(k), pred_nav.velocity());
@@ -1347,8 +1625,14 @@ namespace uwb_imu_fusion
     {
       ROS_INFO("[uwb_imu_fusion] %zu anchors  meas/cycle=%d",
                anchors_.size(), measurements_per_cycle_);
+      ROS_INFO("[uwb_imu_fusion] UWB cycle: min_measurements=%d timeout=%.3f s",
+               min_cycle_measurements_, cycle_timeout_);
       ROS_INFO("[uwb_imu_fusion] gravity=%.3f  tdoa_sigma=%.3f",
                gravity_mag_, tdoa_sigma_);
+      ROS_INFO("[uwb_imu_fusion] dynamic TDOA sigma: %s  min=%.3f max=%.3f residual_scale=%.3f wls_refine=%s",
+               use_dynamic_tdoa_sigma_ ? "enabled" : "disabled",
+               tdoa_sigma_min_, tdoa_sigma_max_, tdoa_residual_sigma_scale_,
+               wls_refine_with_dynamic_sigma_ ? "enabled" : "disabled");
       ROS_INFO("[uwb_imu_fusion] accel units=%s  accel_scale=%.6f  gyro_units=%s",
                imu_accel_in_g_ ? "g" : "m/s^2",
                accel_scale_,
@@ -1361,9 +1645,14 @@ namespace uwb_imu_fusion
                tc_wls_xy_sigma_, tc_wls_z_sigma_);
       ROS_INFO("[uwb_imu_fusion] update regularization: tc_vel=%.3f tc_bias=%.3f",
                tc_update_vel_sigma_, tc_update_bias_sigma_);
+      ROS_INFO("[uwb_imu_fusion] WLS velocity prior: %s  sigma=%.3f max_speed=%.3f max_dt=%.3f",
+               tc_use_wls_velocity_prior_ ? "enabled" : "disabled",
+               tc_wls_velocity_sigma_, tc_wls_velocity_max_speed_, tc_wls_velocity_max_dt_);
       ROS_INFO("[uwb_imu_fusion] imu leveling: %s  samples=%d",
                estimate_initial_orientation_from_imu_ ? "enabled" : "disabled",
                initial_alignment_imu_samples_);
+      ROS_INFO("[uwb_imu_fusion] GT comparison: interpolated at output timestamp, nearest max_dt=%.3f s",
+               gt_match_max_dt_);
       ROS_INFO("[uwb_imu_fusion] tc vertical prior: %s  sigma=%.3f",
                tc_use_vertical_prior_ ? "enabled" : "disabled",
                tc_vertical_prior_sigma_);
@@ -1372,6 +1661,9 @@ namespace uwb_imu_fusion
                tc_wls_xy_sigma_, tc_wls_z_sigma_);
       ROS_INFO("[uwb_imu_fusion] tc WLS rescue: gate=%.3f xy_sigma=%.3f z_sigma=%.3f",
                tc_wls_rescue_gate_, tc_wls_rescue_xy_sigma_, tc_wls_rescue_z_sigma_);
+      ROS_INFO("[uwb_imu_fusion] tc TDOA residual gate: %s  gate=%.3f min_factors=%d",
+               tc_use_tdoa_residual_gate_ ? "enabled" : "disabled",
+               tc_tdoa_residual_gate_, tc_min_tdoa_factors_);
       ROS_INFO("[uwb_imu_fusion] tc attitude prior: %s  roll_pitch_sigma=%.3f yaw_sigma=%.1e",
                tc_use_attitude_prior_ ? "enabled" : "disabled",
                tc_attitude_roll_pitch_sigma_, tc_attitude_yaw_sigma_);
@@ -1380,12 +1672,14 @@ namespace uwb_imu_fusion
     void printCycleInfo(double t_mid, bool wls_ok,
                         const Eigen::Vector3d &wls_p) const
     {
+      gtsam::Point3 gt_at_t;
+      const bool gt_at_t_ok = getGroundTruthAt(t_mid, gt_at_t);
       auto err3 = [&](const gtsam::Point3 &p) -> double
       {
-        return gt_have_ ? std::sqrt(std::pow(p.x() - gt_pos_.x(), 2) +
-                                    std::pow(p.y() - gt_pos_.y(), 2) +
-                                    std::pow(p.z() - gt_pos_.z(), 2))
-                        : -1.0;
+        return gt_at_t_ok ? std::sqrt(std::pow(p.x() - gt_at_t.x(), 2) +
+                                      std::pow(p.y() - gt_at_t.y(), 2) +
+                                      std::pow(p.z() - gt_at_t.z(), 2))
+                          : -1.0;
       };
       ROS_INFO("=================================================");
       ROS_INFO("[TC=%4zu | t=%.3f s]", tc_.cycle_idx, t_mid);
@@ -1404,14 +1698,19 @@ namespace uwb_imu_fusion
                  tc_.bias.accelerometer().x(), tc_.bias.accelerometer().y(),
                  tc_.bias.accelerometer().z());
       }
-      if (gt_have_)
+      if (gt_at_t_ok)
       {
-        ROS_INFO("  GT     : [%7.3f,%7.3f,%7.3f]", gt_pos_.x(), gt_pos_.y(), gt_pos_.z());
+        ROS_INFO("  GT@t   : [%7.3f,%7.3f,%7.3f]", gt_at_t.x(), gt_at_t.y(), gt_at_t.z());
         if (wls_ok)
           ROS_INFO("  |WLS-GT| = %.4f m",
-                   (wls_p - Eigen::Vector3d(gt_pos_.x(), gt_pos_.y(), gt_pos_.z())).norm());
+                   (wls_p - Eigen::Vector3d(gt_at_t.x(), gt_at_t.y(), gt_at_t.z())).norm());
         if (tc_.initialized)
           ROS_INFO("  |TC -GT| = %.4f m", err3(tc_.pose.translation()));
+      }
+      else
+      {
+        ROS_INFO("  GT@t   : unavailable at t=%.3f (buffer=%zu, max_dt=%.3f s)",
+                 t_mid, gt_buf_.size(), gt_match_max_dt_);
       }
       ROS_INFO("=================================================");
     }
@@ -1433,11 +1732,14 @@ namespace uwb_imu_fusion
 
     std::vector<TdoaMeas> current_cycle_;
     std::set<std::pair<int, int>> cycle_pairs_;
-    int measurements_per_cycle_{8}, min_imu_per_cycle_{2};
+    int measurements_per_cycle_{8}, min_cycle_measurements_{6}, min_imu_per_cycle_{2};
     double cycle_timeout_{0.1};
 
     TdoaWlsSolver wls_solver_;
     Eigen::Vector3d wls_guess_{0, 0, 1};
+    Eigen::Vector3d last_wls_p_{0, 0, 1};
+    double last_wls_t_{0.0};
+    bool have_last_wls_{false};
 
     std::deque<ImuMeas> imu_buf_;
     double last_imu_t_{-1.0};
@@ -1458,38 +1760,50 @@ namespace uwb_imu_fusion
     int alignment_acc_count_{0};
 
     // TC IMU noise — data-measured values from static-period analysis
-    double tc_accel_sigma_{0.04};          // [m/s²]  measured ~0.04 m/s² per axis
-    double tc_gyro_sigma_{0.003};          // [rad/s]  measured ~0.0025 rad/s per axis
-    double tc_accel_bias_rw_sigma_{0.01};  // [m/s²/√s] real accel bias ~0.22 m/s²
-    double tc_gyro_bias_rw_sigma_{0.0003}; // [rad/s/√s] gyro bias small and stable
-    double tc_integration_sigma_{1e-4};    // raised: ~974 Hz IMU rate, many steps
+    double tc_accel_sigma_{0.08};          // [m/s²] inflated to lower IMU weight
+    double tc_gyro_sigma_{0.006};          // [rad/s] inflated to lower IMU weight
+    double tc_accel_bias_rw_sigma_{0.02};  // [m/s²/√s] allow bias adaptation
+    double tc_gyro_bias_rw_sigma_{0.0006}; // [rad/s/√s] allow bias adaptation
+    double tc_integration_sigma_{5e-4};    // lower long-window IMU confidence
 
-    // UWB noise — balanced for NLOS robustness + Huber kernel
-    double tdoa_sigma_{0.3}; // [m] — balanced: 0.15 too tight, 0.5 too loose
+    // UWB noise — higher weight with residual gating + Huber kernel
+    double tdoa_sigma_{0.2}; // [m] lower sigma gives UWB more pull
     bool use_robust_noise_{true};
     double huber_k_{1.345};
     gtsam::SharedNoiseModel tdoa_noise_;
+    bool use_dynamic_tdoa_sigma_{true};
+    double tdoa_sigma_min_{0.05};
+    double tdoa_sigma_max_{0.8};
+    double tdoa_residual_sigma_scale_{0.75};
+    bool wls_refine_with_dynamic_sigma_{true};
+    bool tc_use_tdoa_residual_gate_{true};
+    double tc_tdoa_residual_gate_{0.9}; // [m] reject clear per-cycle NLOS spikes
+    int tc_min_tdoa_factors_{4};
 
     // TC priors
     gtsam::Vector6 tc_prior_pose_sigmas_;
     double tc_prior_vel_sigma_{0.1};
     double tc_prior_bias_sigma_{0.1}; // FIX: was 0.001 — too tight, pinned bias at zero
-    double tc_update_vel_sigma_{0.5}; // FIX: was 2.0 — too loose, velocity drifts
-    double tc_update_bias_sigma_{0.1};
+    double tc_update_vel_sigma_{0.8}; // looser: reduce IMU prediction authority
+    double tc_update_bias_sigma_{0.2};
+    bool tc_use_wls_velocity_prior_{true};
+    double tc_wls_velocity_sigma_{0.15};    // [m/s] stronger WLS-derived velocity regularizer
+    double tc_wls_velocity_max_speed_{1.2}; // [m/s] cap noisy WLS finite differences
+    double tc_wls_velocity_max_dt_{0.25};   // [s] reject stale WLS velocity pairs
     bool tc_use_vertical_prior_{true};
-    double tc_vertical_prior_sigma_{0.2};
+    double tc_vertical_prior_sigma_{0.15};
     bool tc_use_wls_position_prior_{true};
-    double tc_wls_xy_sigma_{0.25}; // [m] balanced XY trust
-    double tc_wls_z_sigma_{0.35};  // [m] looser Z: WLS Z less reliable
-    double tc_wls_rescue_gate_{0.25};     // [m] strengthen WLS prior above this XY gap
-    double tc_wls_rescue_xy_sigma_{0.08}; // [m] rescue-mode horizontal WLS prior
-    double tc_wls_rescue_z_sigma_{0.25};  // [m] rescue-mode vertical WLS prior
+    double tc_wls_xy_sigma_{0.15}; // [m] stronger horizontal WLS trust
+    double tc_wls_z_sigma_{0.25};  // [m] looser than XY: WLS Z less reliable
+    double tc_wls_rescue_gate_{0.20};     // [m] strengthen WLS prior above this XY gap
+    double tc_wls_rescue_xy_sigma_{0.06}; // [m] rescue-mode horizontal WLS prior
+    double tc_wls_rescue_z_sigma_{0.18};  // [m] rescue-mode vertical WLS prior
     bool tc_use_attitude_prior_{true};
     double tc_attitude_roll_pitch_sigma_{0.05}; // [rad] strong roll/pitch leveling
     double tc_attitude_yaw_sigma_{1e6};          // [rad] yaw effectively free
     // IMU-dropout fallback parameters
-    double tc_wls_dropout_xy_sigma_{0.40}; // [m] softer WLS prior when no IMU
-    double tc_dropout_vel_sigma_{0.1};     // [m/s] tight vel prior to stop phantom drift
+    double tc_wls_dropout_xy_sigma_{0.25}; // [m] WLS prior when no IMU
+    double tc_dropout_vel_sigma_{0.2};     // [m/s] lower stale-IMU velocity authority
     double wls_innovation_gate_{0.8};      // [m] max WLS↔TC XY gap before rejecting prior
 
     gtsam::Pose3 initial_pose_;
@@ -1503,6 +1817,8 @@ namespace uwb_imu_fusion
 
     bool gt_have_{false};
     gtsam::Point3 gt_pos_{gtsam::Point3::Zero()};
+    std::deque<GtMeas> gt_buf_;
+    double gt_match_max_dt_{0.02};
 
     nav_msgs::Path wls_path_, tc_path_, gt_path_;
 

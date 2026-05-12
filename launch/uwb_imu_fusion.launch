@@ -19,9 +19,10 @@
 
     <!-- Log path -->
     <arg name="trajectory_log_path"
-         default="$(find uwb_imu_fusion)/output/uwb_imu_trajectory_tc_260430.csv" />
+         default="$(find uwb_imu_fusion)/output/uwb_imu_trajectory_tc_260512_1.csv" />
     <arg name="imu_log_path"
          default="$(find uwb_imu_fusion)/output/uwb_imu_raw_imu.csv" />
+    <arg name="gt_match_max_dt" default="0.02" />
 
     <!-- ==================================================================== -->
     <!-- IMU PHYSICS                                                           -->
@@ -57,11 +58,11 @@
     <!--   gives a small but non-trivial floor that prevents numerical         -->
     <!--   ill-conditioning over long (>500 step) integration windows.        -->
     <!-- ==================================================================== -->
-    <arg name="tc_accel_noise_sigma"       default="0.04"   />
-    <arg name="tc_gyro_noise_sigma"        default="0.003"  />
-    <arg name="tc_accel_bias_rw_sigma"     default="0.01"   />
-    <arg name="tc_gyro_bias_rw_sigma"      default="0.0003" />
-    <arg name="tc_integration_noise_sigma" default="1e-4"   />
+    <arg name="tc_accel_noise_sigma"       default="0.08"   />
+    <arg name="tc_gyro_noise_sigma"        default="0.006"  />
+    <arg name="tc_accel_bias_rw_sigma"     default="0.02"   />
+    <arg name="tc_gyro_bias_rw_sigma"      default="0.0006" />
+    <arg name="tc_integration_noise_sigma" default="5e-4"   />
 
     <!-- ==================================================================== -->
     <!-- TC PRIORS                                                             -->
@@ -77,10 +78,16 @@
     <!-- ==================================================================== -->
     <arg name="tc_prior_vel_sigma"   default="0.1"  />
     <arg name="tc_prior_bias_sigma"  default="0.1"  />
-    <arg name="tc_update_vel_sigma"  default="0.5"  />
-    <arg name="tc_update_bias_sigma" default="0.1"  />
+    <arg name="tc_update_vel_sigma"  default="0.8"  />
+    <arg name="tc_update_bias_sigma" default="0.2"  />
+    <!-- WLS velocity regularizes XY only. WLS Z finite differences are noisy and
+         caused vertical lag in the 260511 run, so Z velocity stays IMU-driven. -->
+    <arg name="tc_use_wls_velocity_prior" default="true" />
+    <arg name="tc_wls_velocity_sigma"     default="0.15" />
+    <arg name="tc_wls_velocity_max_speed" default="1.2"  />
+    <arg name="tc_wls_velocity_max_dt"    default="0.25" />
     <arg name="tc_use_vertical_prior"     default="true" />
-    <arg name="tc_vertical_prior_sigma"   default="0.2"  />
+    <arg name="tc_vertical_prior_sigma"   default="0.15" />
 
     <!-- ==================================================================== -->
     <!-- WLS POSITION PRIOR (TC graph)                                        -->
@@ -96,11 +103,11 @@
     <!--   developed an excessive velocity/attitude transient.                -->
     <!-- ==================================================================== -->
     <arg name="tc_use_wls_position_prior" default="true" />
-    <arg name="tc_wls_xy_sigma"           default="0.25" />
-    <arg name="tc_wls_z_sigma"            default="0.35" />
-    <arg name="tc_wls_rescue_gate"        default="0.25" />
-    <arg name="tc_wls_rescue_xy_sigma"    default="0.08" />
-    <arg name="tc_wls_rescue_z_sigma"     default="0.25" />
+    <arg name="tc_wls_xy_sigma"           default="0.10" />
+    <arg name="tc_wls_z_sigma"            default="0.18" />
+    <arg name="tc_wls_rescue_gate"        default="0.20" />
+    <arg name="tc_wls_rescue_xy_sigma"    default="0.04" />
+    <arg name="tc_wls_rescue_z_sigma"     default="0.12" />
 
     <!-- ==================================================================== -->
     <!-- ATTITUDE STABILIZATION (TC graph)                                    -->
@@ -120,12 +127,12 @@
     <!-- wls_innovation_gate: reject WLS prior if WLS is >N m from current TC XY estimate  -->
     <!--   Data: 100% of dropout cycles had valid WLS. Gate prevents destabilisation        -->
     <!--   when TC has already drifted (e.g. from a preceding gap).                         -->
-    <arg name="tc_wls_dropout_xy_sigma"   default="0.40" />
-    <arg name="tc_dropout_vel_sigma"      default="0.1"  />
+    <arg name="tc_wls_dropout_xy_sigma"   default="0.25" />
+    <arg name="tc_dropout_vel_sigma"      default="0.2"  />
     <arg name="wls_innovation_gate"       default="0.8"  />
 
     <rosparam param="/uwb_imu_fusion/tc_prior_pose_sigmas"
-              >[ 0.5, 0.5, 0.5, 0.05, 0.05, 0.02 ]</rosparam>
+              >[ 0.5, 0.5, 0.5, 0.05, 0.05, 0.20 ]</rosparam>
 
     <!-- ==================================================================== -->
     <!-- UWB NOISE                                                             -->
@@ -137,9 +144,21 @@
     <!--   0.3  m + Huber kernel: nominal measurements get full weight;        -->
     <!--     outliers beyond huber_k x tdoa_sigma are auto-downweighted.       -->
     <!-- ==================================================================== -->
-    <arg name="tdoa_sigma"       default="0.3"   />
+    <arg name="tdoa_sigma"       default="0.2"   />
     <arg name="use_robust_noise" default="true"  />
     <arg name="huber_k"          default="1.345" />
+    <arg name="use_dynamic_tdoa_sigma"        default="true" />
+    <arg name="tdoa_sigma_min"                default="0.05" />
+    <arg name="tdoa_sigma_max"                default="0.8"  />
+    <arg name="tdoa_residual_sigma_scale"     default="0.75" />
+    <arg name="wls_refine_with_dynamic_sigma" default="true" />
+    <arg name="tc_use_tdoa_residual_gate" default="true" />
+    <arg name="tc_tdoa_residual_gate"     default="0.9"  />
+    <arg name="tc_min_tdoa_factors"       default="4"    />
+
+    <!-- Cycle handling: process short-but-valid cycles instead of waiting for all
+         8 pairs. This preserves TC update rate when one or two UWB pairs drop. -->
+    <arg name="min_cycle_measurements" default="6" />
 
     <!-- Anchor positions — edit to match your room -->
     <rosparam file="$(find uwb_imu_fusion)/config/anchors.yaml"
@@ -165,6 +184,7 @@
         <!-- Log -->
         <param name="trajectory_log_path" value="$(arg trajectory_log_path)" />
         <param name="imu_log_path"         value="$(arg imu_log_path)"         />
+        <param name="gt_match_max_dt"      value="$(arg gt_match_max_dt)"      />
 
         <!-- IMU physics -->
         <param name="gravity_magnitude" value="$(arg gravity_magnitude)" />
@@ -187,6 +207,10 @@
         <param name="tc_prior_bias_sigma"         value="$(arg tc_prior_bias_sigma)"         />
         <param name="tc_update_vel_sigma"         value="$(arg tc_update_vel_sigma)"         />
         <param name="tc_update_bias_sigma"        value="$(arg tc_update_bias_sigma)"        />
+        <param name="tc_use_wls_velocity_prior"   value="$(arg tc_use_wls_velocity_prior)"   />
+        <param name="tc_wls_velocity_sigma"       value="$(arg tc_wls_velocity_sigma)"       />
+        <param name="tc_wls_velocity_max_speed"   value="$(arg tc_wls_velocity_max_speed)"   />
+        <param name="tc_wls_velocity_max_dt"      value="$(arg tc_wls_velocity_max_dt)"      />
         <param name="tc_use_vertical_prior"       value="$(arg tc_use_vertical_prior)"       />
         <param name="tc_vertical_prior_sigma"     value="$(arg tc_vertical_prior_sigma)"     />
         <param name="tc_use_wls_position_prior"   value="$(arg tc_use_wls_position_prior)"   />
@@ -206,6 +230,15 @@
         <param name="tdoa_sigma"       value="$(arg tdoa_sigma)"       />
         <param name="use_robust_noise" value="$(arg use_robust_noise)" />
         <param name="huber_k"          value="$(arg huber_k)"          />
+        <param name="use_dynamic_tdoa_sigma"        value="$(arg use_dynamic_tdoa_sigma)"        />
+        <param name="tdoa_sigma_min"                value="$(arg tdoa_sigma_min)"                />
+        <param name="tdoa_sigma_max"                value="$(arg tdoa_sigma_max)"                />
+        <param name="tdoa_residual_sigma_scale"     value="$(arg tdoa_residual_sigma_scale)"     />
+        <param name="wls_refine_with_dynamic_sigma" value="$(arg wls_refine_with_dynamic_sigma)" />
+        <param name="tc_use_tdoa_residual_gate" value="$(arg tc_use_tdoa_residual_gate)" />
+        <param name="tc_tdoa_residual_gate"     value="$(arg tc_tdoa_residual_gate)"     />
+        <param name="tc_min_tdoa_factors"       value="$(arg tc_min_tdoa_factors)"       />
+        <param name="min_cycle_measurements"    value="$(arg min_cycle_measurements)"    />
 
     </node>
 
@@ -218,9 +251,9 @@
           name="uwb_imu_fusion_viz_node"
           output="screen" />
 
-    <!-- RViz (optional) -->
+    <!-- RViz (optional)
     <node if="$(arg enable_rviz)"
           type="rviz" pkg="rviz" name="rviz"
-          args="-d $(find uwb_imu_fusion)/config/viz.rviz" />
+          args="-d $(find uwb_imu_fusion)/config/viz.rviz" /> -->
 
 </launch>

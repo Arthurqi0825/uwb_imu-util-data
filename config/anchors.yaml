@@ -22,7 +22,12 @@ anchors:
   # - [3.46541, 3.55897, 2.97106]     # anchor 6
   # - [-3.21123, 3.30412, 0.17618]    # anchor 7
 
-anchor_extrinsic_translation: [-0.12,-0.05,-0.15]    # [x, y, z]
+# anchor_extrinsic_translation: [-0.12,-0.05,-0.15]    # [x, y, z]
+# anchor_extrinsic_translation: [-0.03,-0.05,-0.15]
+# Calibrated from uwb_imu_trajectory_tc_260512_1.csv:
+# mean WLS-GT bias was [-0.1264, -0.0610, +0.2624] m, so subtracting that
+# from the previous translation [-0.12, -0.05, 0.1] aligns WLS to GT.
+anchor_extrinsic_translation: [0.0064, 0.0110, -0.1624]
 
 # --- IMU noise parameters ---
 # IMU runs at ~1008 Hz, accel in g-units, gyro in deg/s.
