@@ -14,6 +14,7 @@ find_package(catkin REQUIRED COMPONENTS
   std_msgs
   sensor_msgs
   geometry_msgs
+  visualization_msgs
   nav_msgs
   tf2
   tf2_ros
@@ -30,7 +31,7 @@ set(GTSAM_LIBRARIES gtsam)
 
 catkin_package(
   INCLUDE_DIRS include
-  CATKIN_DEPENDS roscpp std_msgs sensor_msgs geometry_msgs nav_msgs tf2 tf2_ros tf2_geometry_msgs cf_msgs
+  CATKIN_DEPENDS roscpp std_msgs sensor_msgs geometry_msgs visualization_msgs nav_msgs tf2 tf2_ros tf2_geometry_msgs cf_msgs
   DEPENDS EIGEN3 GTSAM
 )
 
@@ -48,6 +49,17 @@ add_dependencies(uwb_imu_fusion_node
   ${catkin_EXPORTED_TARGETS}
 )
 target_link_libraries(uwb_imu_fusion_node
+  ${catkin_LIBRARIES}
+  gtsam
+)
+
+add_executable(uwb_imu_tc_integrity_node
+  src/uwb_imu_tc_integrity_node.cpp
+)
+add_dependencies(uwb_imu_tc_integrity_node
+  ${catkin_EXPORTED_TARGETS}
+)
+target_link_libraries(uwb_imu_tc_integrity_node
   ${catkin_LIBRARIES}
   gtsam
 )
@@ -80,6 +92,17 @@ add_dependencies(integrity_uwb_node
   ${catkin_EXPORTED_TARGETS}
 )
 target_link_libraries(integrity_uwb_node
+  ${catkin_LIBRARIES}
+  gtsam
+)
+
+add_executable(subset_integrity_uwb_node
+  src/subset_integrity_uwb_node.cpp
+)
+add_dependencies(subset_integrity_uwb_node
+  ${catkin_EXPORTED_TARGETS}
+)
+target_link_libraries(subset_integrity_uwb_node
   ${catkin_LIBRARIES}
   gtsam
 )

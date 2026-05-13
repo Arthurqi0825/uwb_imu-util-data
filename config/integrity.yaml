@@ -1,0 +1,139 @@
+
+# Integrity-monitor tuning for launch/uwb_wls_integrity.launch.
+# Loaded into the integrity node's private namespace.
+
+# Per-anchor ranging noise floor [m]. This is used as the monitor fallback
+# sigma and as the dynamic model base term below.
+integrity_tdoa_noise_sigma: 0.05
+integrity_p_fa: 0.001
+integrity_hal: 1.0
+integrity_val: 2.0
+integrity_ring_threshold: 0.10
+integrity_enable_fde: true
+integrity_gate_full_avail: true
+
+# Dynamic TDOA sigma model:
+#   sigma_i    = base + slope * range_i
+#   sigma_pair = sqrt(sigma_A^2 + sigma_B^2), clamped to [min, max]
+dynamic_tdoa_sigma_enabled: true
+tdoa_range_sigma_base: 0.05
+tdoa_range_sigma_per_meter: 0.005
+tdoa_pair_sigma_min: 0.001
+tdoa_pair_sigma_max: 0.50
+
+# NLOS rejection before the final WLS/integrity pass. The node logs each
+# rejected anchor pair and keeps per-pair/per-anchor counts in the terminal.
+nlos_rejection_enabled: true
+nlos_robust_weighting_enabled: true
+nlos_huber_k: 1.5
+nlos_sigma_inflation_max: 8.0
+nlos_robust_outer_iterations: 4
+
+# Anchor-level NLOS check. A physical blockage usually contaminates every TDOA
+# touching that anchor; post-fit pair residuals can look small after WLS moves
+# the solution. This leave-one-anchor-out test catches that correlated case.
+nlos_anchor_rejection_enabled: true
+nlos_anchor_min_incident_measurements: 2
+nlos_anchor_min_remaining_measurements: 6
+nlos_anchor_solution_shift_gate: 0.18
+nlos_anchor_prior_improvement_gate: 0.15
+nlos_anchor_chi2_ratio: 0.85
+
+# Temporal memory for moving/dynamic obstacles. Suspicious links get their
+# sigmas inflated for a few following cycles, then recover automatically.
+nlos_temporal_filter_enabled: true
+nlos_score_decay: 0.75
+nlos_score_gate_sigma: 2.0
+nlos_score_increment: 1.0
+nlos_score_threshold: 1.0
+nlos_score_sigma_scale_max: 8.0
+
+nlos_residual_gate_sigma: 2.8
+nlos_residual_gate_abs: 0.35
+nlos_max_rejections: 1
+nlos_min_measurements: 6
+
+# 8 UWB anchors positioned in a room (positions in meters, anchor frame)
+anchors:
+# const4 anchor positions:
+
+  - [-3.01020, -4.05891, 0.19629]   # anchor 0
+  - [-3.25867, 3.69663, 2.91016]    # anchor 1
+  - [3.65079, 3.73298, 0.18955]     # anchor 2
+  - [3.50385, -3.95540, 3.03764]    # anchor 3
+  - [-2.79095, -4.13542, 2.84764]   # anchor 4
+  - [3.95388, -3.76246, 0.20348]    # anchor 5
+  - [3.46541, 3.55897, 2.97106]     # anchor 6
+  - [-3.21123, 3.30412, 0.17618]    # anchor 7
+
+# anchor_extrinsic_translation: [-0.12,-0.05,-0.15]    # [x, y, z]
+# anchor_extrinsic_translation: [-0.03,-0.05,-0.15]
+# Calibrated from output/uwb_wls_integrity_dynamic_weight_trajectory.csv.
+# The active integrity run had mean WLS-GT bias [-0.0004, -0.0180, +0.1425] m.
+# Translating all anchors by the negative of that bias reduces the global WLS
+# offset before LC receives the WLS position prior.
+anchor_extrinsic_translation: [0.0068, 0.0290, -0.3049]
+
+# --- IMU noise parameters ---
+# IMU runs at ~1008 Hz, accel in g-units, gyro in deg/s.
+# NOTE: gravity is pre-subtracted upstream, so pitch/roll are NOT observable
+# from the IMU factor. We deliberately inflate accel/gyro noise below so that
+# TDOA + altitude priors dominate, and the IMU factor only acts as a local
+# smoothing term. Do not tighten these without a proper attitude source.
+accel_noise_sigma: 0.05         # was 0.0005 — inflated: IMU is dead-reckoning
+gyro_noise_sigma: 0.01          # was 0.0005 — inflated: attitude unobservable
+accel_bias_rw_sigma: 0.01
+gyro_bias_rw_sigma: 0.00002     # tight: keeps bias near zero
+integration_noise_sigma: 1e-2   # was 1e-3 — looser to match the above
+
+
+# --- TDOA noise ---
+# Observed TDOA residual RMS ~2.0 m, so 0.5 m was too optimistic and pushed
+# Huber into aggressive down-weighting. 1.0 m matches observed noise better.
+tdoa_noise_sigma: 1.0
+
+# --- Cycle detection ---
+num_anchors: 8
+measurements_per_cycle: 8
+min_cycle_measurements: 6       # accept short cycles (UWB drops 1-2 msgs)
+min_imu_per_cycle: 1
+cycle_timeout: 0.1
+lc_wls_reset_threshold: 0.7
+
+# Reject a WLS solution that is internally consistent but physically implausible
+# relative to the last accepted/LC state. This catches local ambiguous TDOA
+# solutions near x ~= -1.3 where chi2 can be low but Z jumps by 0.8-1.2 m.
+wls_consistency_gate_enabled: true
+wls_reference_gate: 0.75
+wls_vertical_gate: 0.55
+wls_max_step: 0.85
+wls_hold_last_on_reject: true
+
+# --- Prior sigmas [rot_x, rot_y, rot_z, tx, ty, tz] ---
+       # was 0.001 — now bias can move away from zero
+  # was 0.0004 — graph can find true ~0.47 bias
+# --- Robust noise ---
+# Huber kernel on the TDOA factor — down-weights outlier anchor pairs once
+# the solution is tracking.
+use_robust_noise: true
+huber_k: 1.345
+
+# --- Initial state ---
+# Initial pose seed for the factor graph, assigned directly from this file.
+# initial_orientation is a quaternion [qx, qy, qz, qw]; identity by default.
+initial_position: [1.27600002288818,0.021999999880791,0.08500000089407]
+initial_orientation: [-0.002767541212961, -0.006918853148818, 0.015221476554871, 0.999856352806091]
+
+# --- Z-axis constraint ---
+# Anchors span Z=0.15-2.67m (weak vertical TDOA geometry) which is the main
+# reason Z diverges. NOTE: these keys are NOT yet consumed by
+# uwb_imu_fusion_node.cpp — wiring them into the factor graph is still TODO.
+use_altitude_constraint: true
+altitude_z_ref: 1.5
+altitude_sigma: 0.5
+zero_vel_sigma: 0.05         # was 0.3 — now actually dominates ImuFactor
+
+
+# --- Misc ---
+max_path_poses: 5000
+log_residuals: true

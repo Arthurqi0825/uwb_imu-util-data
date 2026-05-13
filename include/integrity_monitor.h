@@ -34,14 +34,18 @@
 //   Now uses horizontalMajorAxisSigma() for both the full-set and the
 //   leave-one-out sub-sets, matching Fix 1.
 //
-// NOTE – Weight matrix model
-//   The monitor still uses a diagonal W = diag(1/sigma_i^2). The off-diagonal
-//   correlations arising from shared anchors in C = D·Σ·D^T are a second-order
-//   effect compared with the magnitude of the dynamic sigmas (≈1.5 m) actually
-//   observed in the log. Switching to the full C^-1 is left as a future
-//   improvement; the diagonal approximation is conservative for chi-squared
-//   detection (it under-weights correlated measurements) and is standard
-//   practice in RAIM implementations.
+// FIX 5 – Correlated TDOA covariance (was: diagonal W)
+//   When per-anchor sigmas are supplied, the monitor builds the full
+//   measurement covariance
+//       C = D · Σ · D^T,   Σ = diag(σ_anchor^2),  D[i,k] ∈ {+1,-1,0}
+//   where D encodes the directed pair (idA → idB) of measurement i. The chi²
+//   statistic, P_pos = (H^T C^-1 H)^-1, slope sensitivity, and leave-one-out
+//   HPL all use W = C^-1 instead of diag(1/σ_i^2).
+//
+//   The legacy diagonal path is retained as a fallback when anchor_sigmas is
+//   left empty. With diagonal W the post-fit chi² systematically under-detects
+//   (observed 0% fault rate on a 4125-epoch dataset) and P_pos is optimistic,
+//   so HPL failed to bound the true error in ~2% of available epochs.
 // =============================================================================
 
 #pragma once
@@ -71,7 +75,8 @@ struct IntegrityResult {
   bool   fault_detected{false};
 
   // ── Ring-closure test ───────────────────────────────────────────────────────
-  // ring_sum        = worst signed loop-closure error found [m]
+  // ring_sum        = worst signed loop-closure error found [m]; sign follows
+  //                   the arbitrary a<b<c enumeration, so use |ring_sum|
   // ring_ok         = true when all loops satisfy |error| < ring_threshold
   // ring_closed_loops = number of (a,b,c) triples that had all three edges
   double ring_sum{0.0};
@@ -113,15 +118,21 @@ class TdoaIntegrityMonitor {
   // ---------------------------------------------------------------------------
   // check()  —  main entry point
   //
-  // meas        : TDOA measurements for this epoch
-  // anchors     : anchor positions (world frame)
-  // p_wls       : converged WLS position estimate
-  // tdoa_sigmas : per-measurement 1-sigma [m]; if empty, sqrt(2)*tdoa_noise_sigma
+  // meas          : TDOA measurements for this epoch
+  // anchors       : anchor positions (world frame)
+  // p_wls         : converged WLS position estimate
+  // tdoa_sigmas   : per-measurement 1-sigma [m]; if empty, sqrt(2)*tdoa_noise_sigma.
+  //                 Only used when anchor_sigmas is empty (legacy diagonal path).
+  // anchor_sigmas : per-anchor 1-sigma [m] (size == anchors.size()).
+  //                 When provided, the full correlated covariance
+  //                 C = D · diag(σ_anchor²) · D^T is used (FIX 5).
   // ---------------------------------------------------------------------------
   IntegrityResult check(const std::vector<TdoaMeas>&   meas,
                         const std::vector<gtsam::Point3>& anchors,
                         const Eigen::Vector3d&          p_wls,
                         const Eigen::VectorXd&          tdoa_sigmas =
+                            Eigen::VectorXd(),
+                        const Eigen::VectorXd&          anchor_sigmas =
                             Eigen::VectorXd()) const
   {
     IntegrityResult res;
@@ -144,19 +155,45 @@ class TdoaIntegrityMonitor {
 
     res.residuals.assign(r.data(), r.data() + M);
 
-    // ── Measurement sigma vector ───────────────────────────────────────────
+    // ── Build measurement covariance C (M × M) ─────────────────────────────
+    // FIX 5: if per-anchor sigmas are supplied, use the correlated model
+    //        C = D · diag(σ_anchor²) · D^T.  Otherwise fall back to the
+    //        diagonal model C = diag(σ_pair²) for backwards compatibility.
+    Eigen::MatrixXd C(M, M);
     Eigen::VectorXd meas_sigmas(M);
-    if (tdoa_sigmas.size() == M) {
-      for (int i = 0; i < M; ++i)
-        meas_sigmas(i) = std::max(tdoa_sigmas(i), 1e-9);
+    const bool use_correlated =
+        (anchor_sigmas.size() == static_cast<int>(anchors.size()));
+
+    if (use_correlated) {
+      const int N = static_cast<int>(anchors.size());
+      Eigen::MatrixXd D = Eigen::MatrixXd::Zero(M, N);
+      for (int i = 0; i < M; ++i) {
+        D(i, meas[i].idA) = -1.0;
+        D(i, meas[i].idB) = +1.0;
+      }
+      Eigen::VectorXd sa2 = anchor_sigmas.array().square();
+      C = D * sa2.asDiagonal() * D.transpose();
+      // Floor diagonal to avoid singular C if an anchor sigma was clamped to 0
+      for (int i = 0; i < M; ++i) C(i, i) = std::max(C(i, i), 1e-18);
     } else {
-      meas_sigmas.setConstant(std::sqrt(2.0) * tdoa_noise_sigma);
+      Eigen::VectorXd diag_sig(M);
+      if (tdoa_sigmas.size() == M) {
+        for (int i = 0; i < M; ++i)
+          diag_sig(i) = std::max(tdoa_sigmas(i), 1e-9);
+      } else {
+        diag_sig.setConstant(std::sqrt(2.0) * tdoa_noise_sigma);
+      }
+      C = diag_sig.array().square().matrix().asDiagonal();
     }
-    const Eigen::VectorXd diag_inv = meas_sigmas.array().square().inverse();
+    for (int i = 0; i < M; ++i) meas_sigmas(i) = std::sqrt(C(i, i));
+
+    // W = C^-1  (M × M)
+    const Eigen::MatrixXd W =
+        C.ldlt().solve(Eigen::MatrixXd::Identity(M, M));
 
     // ── Chi-squared global test ────────────────────────────────────────────
     // T = r^T W r  ~  chi2(M-3)  under H0 (no fault)
-    res.chi2_stat = r.cwiseProduct(diag_inv).dot(r);
+    res.chi2_stat = r.dot(W * r);
 
     const int dof       = M - 3;
     res.dof             = dof;
@@ -172,7 +209,7 @@ class TdoaIntegrityMonitor {
     }
 
     // ── Position covariance  P = (H^T W H)^-1 ─────────────────────────────
-    const Eigen::Matrix3d HTSH  = H.transpose() * diag_inv.asDiagonal() * H;
+    const Eigen::Matrix3d HTSH  = H.transpose() * W * H;
     const Eigen::Matrix3d P_pos = HTSH.inverse();
 
     // FIX 1: use major-axis eigenvalue of 2×2 horizontal sub-matrix
@@ -183,13 +220,12 @@ class TdoaIntegrityMonitor {
     const double vpl0 = k_hpl * sigma_v;
 
     // ── Fault-mode HPL/VPL (ARAIM slope method) ───────────────────────────
-    // Sensitivity matrix: W_sens = P * H^T * diag(w)
+    // Sensitivity matrix: W_sens = P_pos * H^T * W   (3 × M)
     // W_sens column k gives the position error per unit bias on measurement k.
-    const Eigen::MatrixXd W_sens =
-        P_pos * H.transpose() * diag_inv.asDiagonal();
+    const Eigen::MatrixXd W_sens = P_pos * H.transpose() * W;
 
-    double hpl_fault = hpl0;
-    double vpl_fault = vpl0;
+    double hpl_fault = 0.0;
+    double vpl_fault = 0.0;
     const double k_md = 4.265;  // missed-detection K for P_MD ≈ 10^-3
 
     for (int k = 0; k < M; ++k) {
@@ -199,29 +235,37 @@ class TdoaIntegrityMonitor {
       const double bias_v = std::fabs(W_sens(2, k));
 
       // sigma after removing measurement k (leave-one-out)
-      // FIX 4: use horizontalMajorAxisSigma() for sub-set as well
+      // FIX 4 + FIX 5: drop row AND column k of C, invert reduced C, then
+      //                P_k = (H_k^T C_k^-1 H_k)^-1
       double sigma_h_k = sigma_major;
       double sigma_v_k = sigma_v;
       if (M > 4) {
         Eigen::MatrixXd H_k(M - 1, 3);
-        Eigen::VectorXd d_k(M - 1);
+        Eigen::MatrixXd C_k(M - 1, M - 1);
         int row = 0;
         for (int i = 0; i < M; ++i) {
           if (i == k) continue;
           H_k.row(row) = H.row(i);
-          d_k(row)     = diag_inv(i);
+          int col = 0;
+          for (int j = 0; j < M; ++j) {
+            if (j == k) continue;
+            C_k(row, col) = C(i, j);
+            ++col;
+          }
           ++row;
         }
+        const Eigen::MatrixXd W_k =
+            C_k.ldlt().solve(Eigen::MatrixXd::Identity(M - 1, M - 1));
         const Eigen::Matrix3d P_k =
-            (H_k.transpose() * d_k.asDiagonal() * H_k).inverse();
-        sigma_h_k = horizontalMajorAxisSigma(P_k);  // FIX 4
+            (H_k.transpose() * W_k * H_k).inverse();
+        sigma_h_k = horizontalMajorAxisSigma(P_k);
         sigma_v_k = std::sqrt(P_k(2, 2));
       }
 
-      // Minimum detectable bias (threshold in measurement space)
-      // det_threshold = sigma_k * sqrt(chi2_thresh)
+      // Minimum detectable bias approximation in measurement space.
+      // det_threshold = sigma_k * sqrt(chi2_thresh) with sigma_k = sqrt(C(k,k))
       const double det_threshold =
-          std::sqrt(res.chi2_threshold / diag_inv(k));
+          std::sqrt(res.chi2_threshold * C(k, k));
 
       hpl_fault = std::max(hpl_fault,
                            bias_h * det_threshold + k_md * sigma_h_k);
@@ -237,7 +281,7 @@ class TdoaIntegrityMonitor {
       double best_chi2 = std::numeric_limits<double>::max();
       int    best_k    = -1;
       for (int k = 0; k < M; ++k) {
-        const double t_k = subsetChi2(diag_inv, H, r, k);
+        const double t_k = subsetChi2(C, H, r, k);
         if (t_k < best_chi2) {
           best_chi2 = t_k;
           best_k    = k;
@@ -399,7 +443,7 @@ class TdoaIntegrityMonitor {
   //   Solves the WLS correction on the reduced set and returns the
   //   weighted sum of squared residuals for the sub-set.
   // ===========================================================================
-  double subsetChi2(const Eigen::VectorXd& diag_inv,
+  double subsetChi2(const Eigen::MatrixXd& C_full,
                     const Eigen::MatrixXd& H_full,
                     const Eigen::VectorXd& r_full,
                     int                    excl) const
@@ -407,25 +451,33 @@ class TdoaIntegrityMonitor {
     const int M  = static_cast<int>(r_full.size());
     const int Ms = M - 1;
     Eigen::MatrixXd H_s(Ms, 3);
-    Eigen::VectorXd d_s(Ms), r_s(Ms);
+    Eigen::MatrixXd C_s(Ms, Ms);
+    Eigen::VectorXd r_s(Ms);
 
     int row = 0;
     for (int i = 0; i < M; ++i) {
       if (i == excl) continue;
       H_s.row(row) = H_full.row(i);
-      d_s(row)     = diag_inv(i);
       r_s(row)     = r_full(i);
+      int col = 0;
+      for (int j = 0; j < M; ++j) {
+        if (j == excl) continue;
+        C_s(row, col) = C_full(i, j);
+        ++col;
+      }
       ++row;
     }
 
+    const Eigen::MatrixXd W_s =
+        C_s.ldlt().solve(Eigen::MatrixXd::Identity(Ms, Ms));
+
     // One WLS correction step on the reduced set
-    const Eigen::Matrix3d HTSH_s =
-        H_s.transpose() * d_s.asDiagonal() * H_s;
+    const Eigen::Matrix3d HTSH_s = H_s.transpose() * W_s * H_s;
     const Eigen::Vector3d dp =
-        -HTSH_s.ldlt().solve(H_s.transpose() * (d_s.asDiagonal() * r_s));
+        -HTSH_s.ldlt().solve(H_s.transpose() * (W_s * r_s));
     const Eigen::VectorXd r_new = r_s + H_s * dp;
 
-    return r_new.cwiseProduct(d_s).dot(r_new);
+    return r_new.dot(W_s * r_new);
   }
 
   // Chi-squared quantile via Boost

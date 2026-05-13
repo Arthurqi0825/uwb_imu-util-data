@@ -1,0 +1,301 @@
+<launch>
+
+    <!-- ============================================================ -->
+    <!-- uwb_imu_tc_integrity — TC FGO with integrity-shaped UWB factors -->
+    <!-- ============================================================ -->
+
+    <!-- Topic remapping -->
+    <arg name="imu_topic" default="/imu_data"  />
+    <arg name="uwb_topic" default="/tdoa_data" />
+    <arg name="gt_topic"  default="/pose_data" />
+
+    <!-- Anchor/calibration config. Default to integrity.yaml so this TC
+         integrity node uses the same calibrated anchor geometry as the WLS
+         integrity pipeline. Override this arg if you intentionally want the
+         older const1 anchors.yaml geometry. -->
+    <arg name="config_file"
+         default="$(find uwb_imu_fusion)/config/integrity.yaml" />
+
+    <!-- Visualization -->
+    <arg name="enable_viz"  default="true" />
+    <arg name="enable_rviz" default="true" />
+
+    <!-- Frame IDs -->
+    <arg name="odom_frame" default="map"       />
+    <arg name="base_frame" default="base_link" />
+
+    <!-- Log path -->
+    <arg name="trajectory_log_path"
+         default="$(find uwb_imu_fusion)/output/uwb_imu_tc_integrity.csv" />
+    <arg name="imu_log_path"
+         default="$(find uwb_imu_fusion)/output/uwb_imu_raw_imu.csv" />
+    <arg name="gt_match_max_dt" default="0.02" />
+
+    <!-- ==================================================================== -->
+    <!-- IMU PHYSICS                                                           -->
+    <!--                                                                       -->
+    <!-- imu_accel_in_g: true  = sensor publishes in g                        -->
+    <!--                          node converts to m/s² via accel_scale =     -->
+    <!--                          gravity_magnitude (load order guaranteed)    -->
+    <!--                                                                       -->
+    <!-- gyro_is_degrees: TRUE — confirmed from log data.                      -->
+    <!--   Raw gyro norm reached 130 during motion.  As rad/s that would be   -->
+    <!--   7.5 rev/s — physically impossible.  As deg/s = 2.3 rad/s = a fast  -->
+    <!--   tilt, consistent with observed UWB trajectory.                      -->
+    <!--   Without this flag the gyro is fed 57.3x too large to GTSAM →       -->
+    <!--   orientation diverges in ~2 s → position error reaches 43 m.        -->
+    <!-- ==================================================================== -->
+    <arg name="gravity_magnitude" default="9.80665" />
+    <arg name="imu_accel_in_g"    default="true" />
+    <arg name="gyro_is_degrees"   default="true" />   <!-- PRIMARY FIX: was false -->
+    <arg name="estimate_initial_orientation_from_imu" default="true" />
+    <arg name="initial_alignment_imu_samples" default="100" />
+
+    <!-- ==================================================================== -->
+    <!-- TC IMU NOISE — data-measured from static-period analysis             -->
+    <!--                                                                       -->
+    <!--   Measured accel noise std (static):   ~0.04 m/s² per axis           -->
+    <!--   Measured gyro  noise std (static):   ~0.0025 rad/s per axis        -->
+    <!--   Measured accel bias (static mean):   ax=+0.22, ay=+0.07 m/s²      -->
+    <!--   Measured gyro  bias (static mean):   ~0.001 rad/s (near-zero)      -->
+    <!--                                                                       -->
+    <!-- tc_integration_noise_sigma raised to 1e-4:                           -->
+    <!--   IMU rate is ~974 Hz.  At 1e-5 the integration covariance per step  -->
+    <!--   (1e-5)^2 = 1e-10 m²/step × N_steps accumulates negligibly; 1e-4   -->
+    <!--   gives a small but non-trivial floor that prevents numerical         -->
+    <!--   ill-conditioning over long (>500 step) integration windows.        -->
+    <!-- ==================================================================== -->
+    <arg name="tc_accel_noise_sigma"       default="0.08"   />
+    <arg name="tc_gyro_noise_sigma"        default="0.006"  />
+    <arg name="tc_accel_bias_rw_sigma"     default="0.02"   />
+    <arg name="tc_gyro_bias_rw_sigma"      default="0.0006" />
+    <arg name="tc_integration_noise_sigma" default="5e-4"   />
+
+    <!-- ==================================================================== -->
+    <!-- TC PRIORS                                                             -->
+    <!--                                                                       -->
+    <!-- tc_prior_bias_sigma:                                                  -->
+    <!--   FIX: was 0.001 — pinned bias to zero for the entire run.           -->
+    <!--   Real MEMS accel biases are 0.05 to 0.3 m/s2.                       -->
+    <!--   Set to 0.1 m/s2 so first-cycle TDOA residuals can correct bias.    -->
+    <!--                                                                       -->
+    <!-- tc_update_vel_sigma:                                                  -->
+    <!--   FIX: was 2.0 m/s — too loose. Velocity drifts 2 m/s from the IMU  -->
+    <!--   prediction between cycles, causing runaway TC errors. Use 0.5 m/s. -->
+    <!-- ==================================================================== -->
+    <arg name="tc_prior_vel_sigma"   default="0.1"  />
+    <arg name="tc_prior_bias_sigma"  default="0.1"  />
+    <arg name="tc_update_vel_sigma"  default="0.8"  />
+    <arg name="tc_update_bias_sigma" default="0.2"  />
+    <!-- WLS velocity regularizes XY only. WLS Z finite differences are noisy and
+         caused vertical lag in the 260511 run, so Z velocity stays IMU-driven. -->
+    <arg name="tc_use_wls_velocity_prior" default="true" />
+    <arg name="tc_wls_velocity_sigma"     default="0.15" />
+    <arg name="tc_wls_velocity_max_speed" default="1.2"  />
+    <arg name="tc_wls_velocity_max_dt"    default="0.25" />
+    <arg name="tc_use_vertical_prior"     default="true" />
+    <arg name="tc_vertical_prior_sigma"   default="0.15" />
+    <!-- Default to WLS height because the flight data changes altitude from
+         ~0.08 m to ~1.5 m. Use "initial" only for truly fixed-height tests. -->
+    <arg name="tc_vertical_prior_source"  default="wls" />
+    <!-- TC-only correction for the observed WLS Z bias in this calibrated run.
+         This is applied only to WLS-derived TC priors, not to logged WLS or RAIM. -->
+    <arg name="tc_wls_z_bias_correction"  default="0.14" />
+
+    <!-- ==================================================================== -->
+    <!-- WLS POSITION PRIOR (TC graph)                                        -->
+    <!--                                                                       -->
+    <!-- Keep WLS tight in XY and moderately trusted in Z.  Z is weaker than   -->
+    <!-- XY, but TC must still follow real altitude changes in the data.        -->
+    <!--                                                                       -->
+    <!-- tc_wls_rescue_*: stronger WLS anchoring when TC begins separating     -->
+    <!--   from WLS but is still below the hard rejection gate. This targets   -->
+    <!--   the observed ~12.5 s failure where WLS stayed near GT while TC      -->
+    <!--   developed an excessive velocity/attitude transient.                -->
+    <!-- ==================================================================== -->
+    <arg name="tc_use_wls_position_prior" default="true" />
+    <arg name="tc_wls_xy_sigma"           default="0.10" />
+    <arg name="tc_wls_z_sigma"            default="0.18" />
+    <arg name="tc_wls_rescue_gate"        default="0.20" />
+    <arg name="tc_wls_rescue_xy_sigma"    default="0.04" />
+    <arg name="tc_wls_rescue_z_sigma"     default="0.12" />
+
+    <!-- ==================================================================== -->
+    <!-- ATTITUDE STABILIZATION (TC graph)                                    -->
+    <!--                                                                       -->
+    <!-- TDOA constrains translation only. Roll/pitch drift can project        -->
+    <!-- gravity into horizontal acceleration and create impossible velocity   -->
+    <!-- spikes. Keep roll/pitch near the leveled startup attitude; leave yaw  -->
+    <!-- effectively free because UWB TDOA does not observe heading.           -->
+    <!-- ==================================================================== -->
+    <arg name="tc_use_attitude_prior"          default="true" />
+    <arg name="tc_attitude_roll_pitch_sigma"   default="0.05" />
+    <arg name="tc_attitude_yaw_sigma"          default="1e6"  />
+
+    <!-- IMU dropout fallback — applied when imu_n < min_imu_per_cycle      -->
+    <!-- tc_wls_dropout_xy_sigma: softer WLS prior (no IMU = less orientation confidence) -->
+    <!-- tc_dropout_vel_sigma: tight velocity prior to prevent phantom drift during gap     -->
+    <!-- wls_innovation_gate: reject WLS prior if WLS is >N m from current TC XY estimate  -->
+    <!--   Data: 100% of dropout cycles had valid WLS. Gate prevents destabilisation        -->
+    <!--   when TC has already drifted (e.g. from a preceding gap).                         -->
+    <arg name="tc_wls_dropout_xy_sigma"   default="0.25" />
+    <arg name="tc_dropout_vel_sigma"      default="0.2"  />
+    <arg name="wls_innovation_gate"       default="0.8"  />
+
+    <rosparam param="/uwb_imu_fusion/tc_prior_pose_sigmas"
+              >[ 0.5, 0.5, 0.5, 0.05, 0.05, 0.20 ]</rosparam>
+
+    <!-- ==================================================================== -->
+    <!-- UWB NOISE                                                             -->
+    <!--                                                                       -->
+    <!-- tdoa_sigma = 0.3 m is the balanced operating point:                  -->
+    <!--   0.15 m (too tight): any multipath/NLOS spike yanks the trajectory  -->
+    <!--     hard — this caused the large error jumps seen in the logs.        -->
+    <!--   0.5  m (too loose): TDOA barely constrains position; IMU drifts.   -->
+    <!--   0.3  m + Huber kernel: nominal measurements get full weight;        -->
+    <!--     outliers beyond huber_k x tdoa_sigma are auto-downweighted.       -->
+    <!-- ==================================================================== -->
+    <arg name="tdoa_sigma"       default="0.2"   />
+    <arg name="use_robust_noise" default="true"  />
+    <arg name="huber_k"          default="1.345" />
+    <arg name="use_dynamic_tdoa_sigma"        default="true" />
+    <arg name="tdoa_sigma_min"                default="0.05" />
+    <arg name="tdoa_sigma_max"                default="0.8"  />
+    <arg name="tdoa_residual_sigma_scale"     default="0.75" />
+    <arg name="wls_refine_with_dynamic_sigma" default="true" />
+    <arg name="tc_use_tdoa_residual_gate" default="true" />
+    <arg name="tc_tdoa_residual_gate"     default="0.9"  />
+    <arg name="tc_min_tdoa_factors"       default="4"    />
+
+    <!-- Integrity monitor for TC UWB factors.
+         The monitor does not replace the factor graph. It edits the UWB factor
+         set before optimization by excluding FDE/hard-gated measurements and
+         inflating sigma for suspicious standardized residuals. -->
+    <arg name="tc_integrity_enabled"             default="true" />
+    <arg name="tc_integrity_tdoa_noise_sigma"    default="0.08" />
+    <arg name="tc_integrity_p_fa"                default="0.001" />
+    <arg name="tc_integrity_hal"                 default="1.0" />
+    <arg name="tc_integrity_val"                 default="2.0" />
+    <arg name="tc_integrity_ring_threshold"      default="0.10" />
+    <arg name="tc_integrity_enable_fde"          default="true" />
+    <arg name="tc_integrity_exclude_fault"       default="true" />
+    <arg name="tc_integrity_sigma_inflation"     default="4.0" />
+    <arg name="tc_integrity_std_resid_soft_gate" default="2.5" />
+    <arg name="tc_integrity_std_resid_hard_gate" default="5.0" />
+    <arg name="tc_integrity_min_factors"         default="4" />
+
+    <!-- Cycle handling: process short-but-valid cycles instead of waiting for all
+         8 pairs. This preserves TC update rate when one or two UWB pairs drop. -->
+    <arg name="min_cycle_measurements" default="6" />
+
+    <!-- Anchor positions and extrinsic calibration -->
+    <rosparam file="$(arg config_file)"
+              command="load" ns="uwb_imu_fusion" />
+
+    <!-- ============================================================ -->
+    <!-- Fusion node                                                   -->
+    <!-- ============================================================ -->
+    <node pkg="uwb_imu_fusion"
+          type="uwb_imu_tc_integrity_node"
+          name="uwb_imu_tc_integrity_node"
+          output="screen">
+
+        <!-- Topic names -->
+        <param name="imu_topic" value="$(arg imu_topic)" />
+        <param name="uwb_topic" value="$(arg uwb_topic)" />
+        <param name="gt_topic"  value="$(arg gt_topic)"  />
+
+        <!-- Frames -->
+        <param name="odom_frame" value="$(arg odom_frame)" />
+        <param name="base_frame" value="$(arg base_frame)" />
+
+        <!-- Log -->
+        <param name="trajectory_log_path" value="$(arg trajectory_log_path)" />
+        <param name="imu_log_path"         value="$(arg imu_log_path)"         />
+        <param name="gt_match_max_dt"      value="$(arg gt_match_max_dt)"      />
+
+        <!-- IMU physics -->
+        <param name="gravity_magnitude" value="$(arg gravity_magnitude)" />
+        <param name="imu_accel_in_g"    value="$(arg imu_accel_in_g)" />
+        <param name="gyro_is_degrees"   value="$(arg gyro_is_degrees)" />
+        <param name="estimate_initial_orientation_from_imu"
+               value="$(arg estimate_initial_orientation_from_imu)" />
+        <param name="initial_alignment_imu_samples"
+               value="$(arg initial_alignment_imu_samples)" />
+
+        <!-- TC IMU noise -->
+        <param name="tc_accel_noise_sigma"       value="$(arg tc_accel_noise_sigma)"       />
+        <param name="tc_gyro_noise_sigma"        value="$(arg tc_gyro_noise_sigma)"        />
+        <param name="tc_accel_bias_rw_sigma"     value="$(arg tc_accel_bias_rw_sigma)"     />
+        <param name="tc_gyro_bias_rw_sigma"      value="$(arg tc_gyro_bias_rw_sigma)"      />
+        <param name="tc_integration_noise_sigma" value="$(arg tc_integration_noise_sigma)" />
+
+        <!-- TC priors -->
+        <param name="tc_prior_vel_sigma"          value="$(arg tc_prior_vel_sigma)"          />
+        <param name="tc_prior_bias_sigma"         value="$(arg tc_prior_bias_sigma)"         />
+        <param name="tc_update_vel_sigma"         value="$(arg tc_update_vel_sigma)"         />
+        <param name="tc_update_bias_sigma"        value="$(arg tc_update_bias_sigma)"        />
+        <param name="tc_use_wls_velocity_prior"   value="$(arg tc_use_wls_velocity_prior)"   />
+        <param name="tc_wls_velocity_sigma"       value="$(arg tc_wls_velocity_sigma)"       />
+        <param name="tc_wls_velocity_max_speed"   value="$(arg tc_wls_velocity_max_speed)"   />
+        <param name="tc_wls_velocity_max_dt"      value="$(arg tc_wls_velocity_max_dt)"      />
+        <param name="tc_use_vertical_prior"       value="$(arg tc_use_vertical_prior)"       />
+        <param name="tc_vertical_prior_sigma"     value="$(arg tc_vertical_prior_sigma)"     />
+        <param name="tc_vertical_prior_source"    value="$(arg tc_vertical_prior_source)"    />
+        <param name="tc_wls_z_bias_correction"   value="$(arg tc_wls_z_bias_correction)"    />
+        <param name="tc_use_wls_position_prior"   value="$(arg tc_use_wls_position_prior)"   />
+        <param name="tc_wls_xy_sigma"             value="$(arg tc_wls_xy_sigma)"             />
+        <param name="tc_wls_z_sigma"              value="$(arg tc_wls_z_sigma)"              />
+        <param name="tc_wls_rescue_gate"          value="$(arg tc_wls_rescue_gate)"          />
+        <param name="tc_wls_rescue_xy_sigma"      value="$(arg tc_wls_rescue_xy_sigma)"      />
+        <param name="tc_wls_rescue_z_sigma"       value="$(arg tc_wls_rescue_z_sigma)"       />
+        <param name="tc_use_attitude_prior"       value="$(arg tc_use_attitude_prior)"       />
+        <param name="tc_attitude_roll_pitch_sigma" value="$(arg tc_attitude_roll_pitch_sigma)" />
+        <param name="tc_attitude_yaw_sigma"       value="$(arg tc_attitude_yaw_sigma)"       />
+        <param name="tc_wls_dropout_xy_sigma"     value="$(arg tc_wls_dropout_xy_sigma)"     />
+        <param name="tc_dropout_vel_sigma"        value="$(arg tc_dropout_vel_sigma)"        />
+        <param name="wls_innovation_gate"         value="$(arg wls_innovation_gate)"         />
+
+        <!-- UWB -->
+        <param name="tdoa_sigma"       value="$(arg tdoa_sigma)"       />
+        <param name="use_robust_noise" value="$(arg use_robust_noise)" />
+        <param name="huber_k"          value="$(arg huber_k)"          />
+        <param name="use_dynamic_tdoa_sigma"        value="$(arg use_dynamic_tdoa_sigma)"        />
+        <param name="tdoa_sigma_min"                value="$(arg tdoa_sigma_min)"                />
+        <param name="tdoa_sigma_max"                value="$(arg tdoa_sigma_max)"                />
+        <param name="tdoa_residual_sigma_scale"     value="$(arg tdoa_residual_sigma_scale)"     />
+        <param name="wls_refine_with_dynamic_sigma" value="$(arg wls_refine_with_dynamic_sigma)" />
+        <param name="tc_use_tdoa_residual_gate" value="$(arg tc_use_tdoa_residual_gate)" />
+        <param name="tc_tdoa_residual_gate"     value="$(arg tc_tdoa_residual_gate)"     />
+        <param name="tc_min_tdoa_factors"       value="$(arg tc_min_tdoa_factors)"       />
+        <param name="tc_integrity_enabled"             value="$(arg tc_integrity_enabled)"             />
+        <param name="tc_integrity_tdoa_noise_sigma"    value="$(arg tc_integrity_tdoa_noise_sigma)"    />
+        <param name="tc_integrity_p_fa"                value="$(arg tc_integrity_p_fa)"                />
+        <param name="tc_integrity_hal"                 value="$(arg tc_integrity_hal)"                 />
+        <param name="tc_integrity_val"                 value="$(arg tc_integrity_val)"                 />
+        <param name="tc_integrity_ring_threshold"      value="$(arg tc_integrity_ring_threshold)"      />
+        <param name="tc_integrity_enable_fde"          value="$(arg tc_integrity_enable_fde)"          />
+        <param name="tc_integrity_exclude_fault"       value="$(arg tc_integrity_exclude_fault)"       />
+        <param name="tc_integrity_sigma_inflation"     value="$(arg tc_integrity_sigma_inflation)"     />
+        <param name="tc_integrity_std_resid_soft_gate" value="$(arg tc_integrity_std_resid_soft_gate)" />
+        <param name="tc_integrity_std_resid_hard_gate" value="$(arg tc_integrity_std_resid_hard_gate)" />
+        <param name="tc_integrity_min_factors"         value="$(arg tc_integrity_min_factors)"         />
+        <param name="min_cycle_measurements"    value="$(arg min_cycle_measurements)"    />
+
+    </node>
+
+    <!-- ============================================================ -->
+    <!-- Visualization (optional)                                     -->
+    <!-- ============================================================ -->
+    <node if="$(arg enable_viz)"
+          pkg="uwb_imu_fusion"
+          type="uwb_imu_fusion_viz_node"
+          name="uwb_imu_fusion_viz_node"
+          output="screen" />
+
+    <!-- RViz (optional)
+    <node if="$(arg enable_rviz)"
+          type="rviz" pkg="rviz" name="rviz"
+          args="-d $(find uwb_imu_fusion)/config/viz.rviz" /> -->
+
+</launch>

@@ -148,15 +148,73 @@ class TdoaWlsSolver {
       p += dp;
 
       if (dp.norm() < tol_) {
-        ROS_WARN("[TdoaWlsSolver] Converged in %d iterations "
-                 "(residual norm=%.3f), dp norm=%.3f",
-                 iter + 1, r.norm(), dp.norm());
+        ROS_DEBUG("[TdoaWlsSolver] Converged in %d iterations "
+                  "(residual norm=%.3f), dp norm=%.3f",
+                  iter + 1, r.norm(), dp.norm());
         return true;
       }
     }
 
     // Iteration limit reached without convergence.
     return false;
+  }
+
+  // ---------------------------------------------------------------------------
+  // solveRobustWeighted()
+  //
+  // Iteratively re-weighted WLS using a Huber loss in normalized residual space.
+  // Large post-fit residuals keep the original measurement but inflate its
+  // effective sigma, which is usually safer than dropping TDOAs until the
+  // geometry has too little redundancy.
+  // ---------------------------------------------------------------------------
+  bool solveRobustWeighted(const std::vector<TdoaMeas>&      meas,
+                           const std::vector<gtsam::Point3>& anchors,
+                           const Eigen::VectorXd&            sigma,
+                           Eigen::Vector3d&                  p,
+                           double                            huber_k,
+                           double                            max_sigma_scale,
+                           int                               outer_iter,
+                           Eigen::VectorXd*                  effective_sigma = nullptr) const {
+    if (static_cast<int>(meas.size()) < kMinMeasurements) return false;
+    if (sigma.size() != static_cast<int>(meas.size())) {
+      const bool ok = solveWeighted(meas, anchors, sigma, p);
+      if (effective_sigma) *effective_sigma = sigma;
+      return ok;
+    }
+
+    const int n = static_cast<int>(meas.size());
+    huber_k = std::max(huber_k, 1e-6);
+    max_sigma_scale = std::max(max_sigma_scale, 1.0);
+    outer_iter = std::max(1, outer_iter);
+
+    Eigen::VectorXd eff_sigma = sigma;
+    bool ok = false;
+    for (int outer = 0; outer < outer_iter; ++outer) {
+      ok = solveWeighted(meas, anchors, eff_sigma, p);
+      if (!ok) break;
+
+      Eigen::VectorXd residuals(n);
+      computeResiduals(meas, anchors, p, residuals);
+
+      Eigen::VectorXd next_sigma = sigma;
+      for (int i = 0; i < n; ++i) {
+        const double base_sigma = std::max(sigma(i), kMinDist);
+        const double std_abs = std::fabs(residuals(i)) / base_sigma;
+        if (std_abs > huber_k) {
+          const double huber_weight = huber_k / std_abs;
+          const double scale = std::min(max_sigma_scale,
+                                        1.0 / std::sqrt(std::max(huber_weight, kMinDist)));
+          next_sigma(i) = base_sigma * scale;
+        }
+      }
+
+      if ((next_sigma - eff_sigma).norm() < 1e-6) break;
+      eff_sigma = next_sigma;
+    }
+
+    if (ok) ok = solveWeighted(meas, anchors, eff_sigma, p);
+    if (effective_sigma) *effective_sigma = eff_sigma;
+    return ok;
   }
 
   // ---------------------------------------------------------------------------
@@ -173,6 +231,26 @@ class TdoaWlsSolver {
   static constexpr int    kMinMeasurements = 3;
   /// Minimum distance used in the denominator to prevent division by zero.
   static constexpr double kMinDist         = 1e-9;
+
+  static void computeResiduals(const std::vector<TdoaMeas>&      meas,
+                               const std::vector<gtsam::Point3>& anchors,
+                               const Eigen::Vector3d&            p,
+                               Eigen::VectorXd&                  r) {
+    const int n = static_cast<int>(meas.size());
+    r.resize(n);
+    for (int i = 0; i < n; ++i) {
+      const auto& m = meas[i];
+      const Eigen::Vector3d aA(anchors[m.idA].x(),
+                               anchors[m.idA].y(),
+                               anchors[m.idA].z());
+      const Eigen::Vector3d aB(anchors[m.idB].x(),
+                               anchors[m.idB].y(),
+                               anchors[m.idB].z());
+      const double rA = std::max((p - aA).norm(), kMinDist);
+      const double rB = std::max((p - aB).norm(), kMinDist);
+      r(i) = (rB - rA) - m.tdoa;
+    }
+  }
 };
 
 }  // namespace uwb_imu_fusion

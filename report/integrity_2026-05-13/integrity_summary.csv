@@ -1,0 +1,3 @@
+file,kind,rows,duration_s,available_rows,fault_rows,hpl_mean,hpl_p95,vpl_mean,vpl_p95,rows_with_exclusions
+uwb_imu_tc_integrity.csv,tc,1585,107.404945,1580,0,0.3773444100946372,0.56099,0.6945429835962146,1.0922195999999997,0
+260513_const4_1_2_1uwb_wls_integrity.csv,lc,2953,70.020562,2748,53,0.8129702746359635,0.9984604,1.2307588882796436,1.84992365,811

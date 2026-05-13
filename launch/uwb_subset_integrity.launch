@@ -1,0 +1,96 @@
+<launch>
+
+  <!-- Anchor/config file loaded globally and privately so the node can read
+       both /uwb_imu_fusion/* and private integrity parameters. -->
+  <arg name="anchors_config_file"
+       default="$(find uwb_imu_fusion)/config/integrity.yaml"/>
+  <arg name="integrity_config_file"
+       default="$(find uwb_imu_fusion)/config/integrity.yaml"/>
+
+  <arg name="imu_topic"        default="/imu_data"/>
+  <arg name="uwb_topic"        default="/tdoa_data"/>
+  <arg name="gt_topic"         default="/pose_data"/>
+  <arg name="odom_frame"       default="map"/>
+  <arg name="base_frame"       default="base_link"/>
+  <arg name="imu_accel_in_g"   default="true"/>
+  <arg name="gyro_is_degrees"  default="true"/>
+  <arg name="gravity_magnitude" default="9.80665"/>
+
+  <!-- Keep LC close to the subset-consensus WLS output. -->
+  <arg name="wls_position_sigma" default="0.15"/>
+  <arg name="prior_pose_sigmas"  default="[0.5, 0.5, 0.5, 0.1, 0.1, 0.1]"/>
+  <arg name="prior_vel_sigma"    default="0.1"/>
+  <arg name="prior_bias_sigma"   default="0.01"/>
+  <arg name="lc_update_vel_sigma"  default="2.0"/>
+  <arg name="lc_update_bias_sigma" default="0.5"/>
+
+  <!-- Subset-consensus integrity parameters.
+       anchor_count=0 means use all active anchors except one, e.g. 5 of 6. -->
+  <arg name="subset_consensus_enabled"          default="true"/>
+  <arg name="subset_consensus_trials"           default="80"/>
+  <arg name="subset_consensus_anchor_count"     default="0"/>
+  <arg name="subset_consensus_min_measurements" default="3"/>
+  <arg name="subset_consensus_cluster_gate"     default="0.25"/>
+  <arg name="subset_consensus_reject_score"     default="0.55"/>
+  <arg name="subset_consensus_min_support"      default="3"/>
+
+  <arg name="trajectory_log_path"
+       default="$(find uwb_imu_fusion)/output/uwb_subset_integrity_trajectory.csv"/>
+
+  <arg name="rviz" default="true"/>
+  <arg name="rviz_config"
+       default="$(find uwb_imu_fusion)/config/integrity.rviz"/>
+
+  <rosparam ns="uwb_imu_fusion"
+            file="$(arg anchors_config_file)"
+            command="load"/>
+
+  <node name="uwb_subset_integrity_node"
+        pkg="uwb_imu_fusion"
+        type="subset_integrity_uwb_node"
+        output="screen"
+        required="true">
+
+    <remap from="imu_data"   to="$(arg imu_topic)"/>
+    <remap from="tdoa_data"  to="$(arg uwb_topic)"/>
+    <remap from="pose_data"  to="$(arg gt_topic)"/>
+
+    <rosparam file="$(arg integrity_config_file)"
+              command="load"/>
+
+    <param name="odom_frame"       value="$(arg odom_frame)"       type="str"/>
+    <param name="base_frame"       value="$(arg base_frame)"       type="str"/>
+    <param name="imu_topic"        value="$(arg imu_topic)"        type="str"/>
+    <param name="uwb_topic"        value="$(arg uwb_topic)"        type="str"/>
+    <param name="gt_topic"         value="$(arg gt_topic)"         type="str"/>
+    <param name="imu_accel_in_g"   value="$(arg imu_accel_in_g)"  type="bool"/>
+    <param name="gyro_is_degrees"  value="$(arg gyro_is_degrees)" type="bool"/>
+    <param name="gravity_magnitude" value="$(arg gravity_magnitude)" type="double"/>
+
+    <param name="wls_position_sigma" value="$(arg wls_position_sigma)" type="double"/>
+    <rosparam param="prior_pose_sigmas" subst_value="true">$(arg prior_pose_sigmas)</rosparam>
+    <param name="prior_vel_sigma"    value="$(arg prior_vel_sigma)"    type="double"/>
+    <param name="prior_bias_sigma"   value="$(arg prior_bias_sigma)"   type="double"/>
+    <param name="lc_update_vel_sigma"  value="$(arg lc_update_vel_sigma)"  type="double"/>
+    <param name="lc_update_bias_sigma" value="$(arg lc_update_bias_sigma)" type="double"/>
+
+    <param name="subset_consensus_enabled"          value="$(arg subset_consensus_enabled)"          type="bool"/>
+    <param name="subset_consensus_trials"           value="$(arg subset_consensus_trials)"           type="int"/>
+    <param name="subset_consensus_anchor_count"     value="$(arg subset_consensus_anchor_count)"     type="int"/>
+    <param name="subset_consensus_min_measurements" value="$(arg subset_consensus_min_measurements)" type="int"/>
+    <param name="subset_consensus_cluster_gate"     value="$(arg subset_consensus_cluster_gate)"     type="double"/>
+    <param name="subset_consensus_reject_score"     value="$(arg subset_consensus_reject_score)"     type="double"/>
+    <param name="subset_consensus_min_support"      value="$(arg subset_consensus_min_support)"      type="int"/>
+
+    <param name="trajectory_log_path" value="$(arg trajectory_log_path)" type="str"/>
+
+  </node>
+
+  <node if="$(arg rviz)"
+        name="rviz"
+        pkg="rviz"
+        type="rviz"
+        args="-d $(arg rviz_config)"
+        output="screen"/>
+
+</launch>
