@@ -213,6 +213,13 @@ def print_integrity_summary(df: pd.DataFrame):
     print(f"fault rows              : {int(fault.sum())}/{len(df)}")
     print(f"rows with exclusions    : {int((excluded_count > 0).sum())}/{len(df)}")
     print(f"mean input/factor count : {input_count.mean():.2f} / {factor_count.mean():.2f}")
+    if "nlos_anchor_removed" in df:
+        removed = bool_col(df, "nlos_anchor_removed")
+        print(f"NLOS anchor removed rows: {int(removed.sum())}/{len(df)}")
+        if "nlos_anchor_id" in df and removed.any():
+            counts = numeric_col(df.loc[removed], "nlos_anchor_id").astype(int).value_counts().sort_index()
+            detail = ", ".join(f"{idx}:{count}" for idx, count in counts.items())
+            print(f"NLOS anchor frequency   : {detail}")
 
     hpl = numeric_col(df, "integ_hpl")
     vpl = numeric_col(df, "integ_vpl")
@@ -232,14 +239,19 @@ def analyze_trajectory(df: pd.DataFrame, kind: str, title: str, save_path: str |
     t = df["timestamp"].to_numpy()
     fu_ex, fu_ey, fu_ez = per_axis_err(df, fused)
 
-    print_stats_table({
-        "WLS (UWB only)": err_stats(df["wls_gt_err"]),
-        fused_label: err_stats(df[f"{fused}_gt_err"]),
-    })
+    stats = {"WLS all anchors": err_stats(df["wls_gt_err"])}
+    if "wls_clean_gt_err" in df:
+        stats["WLS clean LOS"] = err_stats(df["wls_clean_gt_err"])
+    stats[fused_label] = err_stats(df[f"{fused}_gt_err"])
+    print_stats_table(stats)
 
     print("\n=== Per-axis mean bias (estimate - GT, m) ===")
     rows = {}
-    for prefix, label in [("wls", "WLS"), (fused, fused_label)]:
+    axis_rows = [("wls", "WLS all anchors")]
+    if {"wls_clean_x", "wls_clean_y", "wls_clean_z"}.issubset(df.columns):
+        axis_rows.append(("wls_clean", "WLS clean LOS"))
+    axis_rows.append((fused, fused_label))
+    for prefix, label in axis_rows:
         ex, ey, ez = per_axis_err(df, prefix)
         rows[label] = {
             "dx_mean": ex.mean(), "dy_mean": ey.mean(), "dz_mean": ez.mean(),
@@ -253,6 +265,8 @@ def analyze_trajectory(df: pd.DataFrame, kind: str, title: str, save_path: str |
     ax = fig.add_subplot(2, 3, 1)
     ax.plot(df["gt_x"], df["gt_y"], "k-", lw=2, label="Ground truth")
     ax.plot(df["wls_x"], df["wls_y"], "r.", ms=2, alpha=0.35, label="WLS")
+    if {"wls_clean_x", "wls_clean_y"}.issubset(df.columns):
+        ax.plot(df["wls_clean_x"], df["wls_clean_y"], "c.", ms=2, alpha=0.45, label="WLS clean")
     ax.plot(df[f"{fused}_x"], df[f"{fused}_y"], "b-", alpha=0.85, label=fused_label)
     ax.set_title("XY trajectory")
     ax.set_xlabel("x (m)")
@@ -264,6 +278,9 @@ def analyze_trajectory(df: pd.DataFrame, kind: str, title: str, save_path: str |
     ax = fig.add_subplot(2, 3, 2, projection="3d")
     ax.plot(df["gt_x"], df["gt_y"], df["gt_z"], "k-", lw=2, label="GT")
     ax.plot(df["wls_x"], df["wls_y"], df["wls_z"], "r.", ms=1.5, alpha=0.35, label="WLS")
+    if {"wls_clean_x", "wls_clean_y", "wls_clean_z"}.issubset(df.columns):
+        ax.plot(df["wls_clean_x"], df["wls_clean_y"], df["wls_clean_z"],
+                "c.", ms=1.5, alpha=0.45, label="WLS clean")
     ax.plot(df[f"{fused}_x"], df[f"{fused}_y"], df[f"{fused}_z"], "b-", alpha=0.85, label=fused_label)
     ax.set_title("3D trajectory")
     ax.set_xlabel("x")
@@ -273,6 +290,8 @@ def analyze_trajectory(df: pd.DataFrame, kind: str, title: str, save_path: str |
 
     ax = fig.add_subplot(2, 3, 3)
     ax.plot(t, df["wls_gt_err"], "r", alpha=0.55, label="WLS")
+    if "wls_clean_gt_err" in df:
+        ax.plot(t, df["wls_clean_gt_err"], "c", alpha=0.65, label="WLS clean")
     ax.plot(t, df[f"{fused}_gt_err"], "b", alpha=0.85, label=fused_label)
     ax.set_title("Position error")
     ax.set_xlabel("t (s)")
@@ -293,6 +312,8 @@ def analyze_trajectory(df: pd.DataFrame, kind: str, title: str, save_path: str |
 
     ax = fig.add_subplot(2, 3, 5)
     ax.plot(t, df["wls_z"] - df["gt_z"], "r", alpha=0.65, label="WLS z err")
+    if "wls_clean_z" in df:
+        ax.plot(t, df["wls_clean_z"] - df["gt_z"], "c", alpha=0.70, label="WLS clean z err")
     ax.plot(t, df[f"{fused}_z"] - df["gt_z"], "b", alpha=0.85, label=f"{fused.upper()} z err")
     ax.axhline(0, color="k", lw=0.5)
     ax.set_title("Vertical error focus")

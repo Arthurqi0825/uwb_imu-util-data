@@ -316,9 +316,28 @@ namespace uwb_imu_fusion
       get("tc_integrity_sigma_inflation", tc_integrity_sigma_inflation_, 4.0);
       get("tc_integrity_std_resid_soft_gate", tc_integrity_std_resid_soft_gate_, 2.5);
       get("tc_integrity_std_resid_hard_gate", tc_integrity_std_resid_hard_gate_, 5.0);
+      get("tc_integrity_gate_wls_on_unavailable",
+          tc_integrity_gate_wls_on_unavailable_, true);
+      get("tc_integrity_unavailable_sigma_scale",
+          tc_integrity_unavailable_sigma_scale_, 3.0);
       get("tc_integrity_min_factors", tc_integrity_min_factors_, 4);
       tc_integrity_min_factors_ =
           std::min(std::max(tc_integrity_min_factors_, 3), measurements_per_cycle_);
+      get("tc_nlos_anchor_rejection_enabled",
+          tc_nlos_anchor_rejection_enabled_, true);
+      get("tc_nlos_anchor_min_incident_measurements",
+          tc_nlos_anchor_min_incident_measurements_, 2);
+      get("tc_nlos_anchor_min_remaining_measurements",
+          tc_nlos_anchor_min_remaining_measurements_, 5);
+      tc_nlos_anchor_min_remaining_measurements_ =
+          std::min(std::max(tc_nlos_anchor_min_remaining_measurements_, 4),
+                   measurements_per_cycle_);
+      get("tc_nlos_anchor_hpl_improvement_ratio",
+          tc_nlos_anchor_hpl_improvement_ratio_, 0.85);
+      get("tc_nlos_anchor_chi2_improvement_ratio",
+          tc_nlos_anchor_chi2_improvement_ratio_, 0.80);
+      get("tc_nlos_anchor_max_clean_wls_shift",
+          tc_nlos_anchor_max_clean_wls_shift_, 2.0);
 
       // ---------------------------------------------------------------------------
       // TC priors
@@ -477,6 +496,7 @@ namespace uwb_imu_fusion
         traj_log_ << "timestamp,"
                   << "gt_x,gt_y,gt_z,"
                   << "wls_x,wls_y,wls_z,"
+                  << "wls_clean_x,wls_clean_y,wls_clean_z,"
                   << "tc_x,tc_y,tc_z,"
                   << "tc_qx,tc_qy,tc_qz,tc_qw,"
                   << "tc_vx,tc_vy,tc_vz,"
@@ -485,7 +505,9 @@ namespace uwb_imu_fusion
                   << "imu_n,imu_mean_ax,imu_mean_ay,imu_mean_az,"
                   << "imu_mean_gx,imu_mean_gy,imu_mean_gz,"
                   << "imu_accel_norm_mean,imu_gyro_norm_mean,"
-                  << "wls_gt_err,tc_gt_err,"
+                  << "wls_gt_err,wls_clean_gt_err,tc_gt_err,"
+                  << "nlos_anchor_id,nlos_anchor_removed,clean_meas_count,"
+                  << "clean_excluded_anchors,"
                   << "integ_used,integ_input_count,integ_factor_count,integ_excluded_count,"
                   << "integ_chi2,integ_threshold,integ_dof,integ_fault,"
                   << "integ_ring_sum,integ_ring_ok,integ_ring_closed_loops,"
@@ -556,6 +578,19 @@ namespace uwb_imu_fusion
       int input_count{0};
       int excluded_count{0};
       bool used_monitor{false};
+    };
+
+    struct CleanLosSelection
+    {
+      std::vector<TdoaMeas> meas;
+      Eigen::VectorXd sigmas;
+      Eigen::Vector3d wls_p{0, 0, 0};
+      bool wls_ok{false};
+      bool used_clean{false};
+      int nlos_anchor_id{-1};
+      std::vector<std::string> excluded_anchors;
+      IntegrityResult all_result;
+      IntegrityResult clean_result;
     };
 
     static std::string csvList(const std::vector<std::string> &items)
@@ -633,8 +668,11 @@ namespace uwb_imu_fusion
       return s;
     }
 
-    void logRow(double t, bool wls_ok, const Eigen::Vector3d &wls_p,
+    void logRow(double t,
+                bool wls_ok, const Eigen::Vector3d &wls_p,
+                bool clean_wls_ok, const Eigen::Vector3d &clean_wls_p,
                 const CycleImuStats &imu_stats,
+                const CleanLosSelection &clean,
                 const TcIntegritySelection &integrity)
     {
       if (!traj_log_.is_open())
@@ -663,6 +701,10 @@ namespace uwb_imu_fusion
                 << (wls_ok ? wls_p.x() : nan) << ","
                 << (wls_ok ? wls_p.y() : nan) << ","
                 << (wls_ok ? wls_p.z() : nan) << ","
+                // Clean LOS WLS position
+                << (clean_wls_ok ? clean_wls_p.x() : nan) << ","
+                << (clean_wls_ok ? clean_wls_p.y() : nan) << ","
+                << (clean_wls_ok ? clean_wls_p.z() : nan) << ","
                 // TC position + orientation
                 << tp.x() << "," << tp.y() << "," << tp.z() << ","
                 << tq.x() << "," << tq.y() << "," << tq.z() << "," << tq.w() << ","
@@ -684,7 +726,12 @@ namespace uwb_imu_fusion
                 << imu_stats.mean_gyro_norm << ","
                 // errors
                 << (wls_ok && gt_at_t_ok ? (wls_p - gt_e).norm() : nan) << ","
+                << (clean_wls_ok && gt_at_t_ok ? (clean_wls_p - gt_e).norm() : nan) << ","
                 << (tc_.initialized && gt_at_t_ok ? (tp - gt_e).norm() : nan) << ","
+                << clean.nlos_anchor_id << ","
+                << (clean.used_clean ? 1 : 0) << ","
+                << clean.meas.size() << ","
+                << csvList(clean.excluded_anchors) << ","
                 // integrity monitor summary
                 << (integrity.used_monitor ? 1 : 0) << ","
                 << integrity.input_count << ","
@@ -1035,6 +1082,37 @@ namespace uwb_imu_fusion
         }
       }
 
+      if (!out.result.available && out.sigmas.size() == static_cast<int>(meas.size()))
+      {
+        const double h_scale =
+            std::isfinite(out.result.hpl) && tc_integrity_monitor_.hal > 1e-9
+                ? out.result.hpl / tc_integrity_monitor_.hal
+                : 1.0;
+        const double v_scale =
+            std::isfinite(out.result.vpl) && tc_integrity_monitor_.val > 1e-9
+                ? out.result.vpl / tc_integrity_monitor_.val
+                : 1.0;
+        const double scale = std::min(
+            tc_integrity_sigma_inflation_,
+            std::max(tc_integrity_unavailable_sigma_scale_,
+                     std::max(h_scale, v_scale)));
+
+        for (size_t i = 0; i < meas.size(); ++i)
+        {
+          out.sigmas(static_cast<int>(i)) *= scale;
+          out.labels[i] =
+              (out.labels[i] == "nominal") ? "unavailable" : out.labels[i] + "+unavailable";
+          if (i < out.factor_sigmas.size())
+            out.factor_sigmas[i] = out.sigmas(static_cast<int>(i));
+        }
+
+        ROS_WARN_THROTTLE(
+            0.5,
+            "[TC-Integrity] t=%.3f unavailable: HPL/VPL=%.3f/%.3f limits=%.3f/%.3f, inflating TC TDOA sigmas x%.2f",
+            t_mid, out.result.hpl, out.result.vpl,
+            tc_integrity_monitor_.hal, tc_integrity_monitor_.val, scale);
+      }
+
       std::set<int> drop;
       if (tc_integrity_exclude_fault_ &&
           out.result.excluded_idx >= 0 &&
@@ -1101,6 +1179,198 @@ namespace uwb_imu_fusion
       return out;
     }
 
+    static std::string anchorName(int id)
+    {
+      return std::to_string(id);
+    }
+
+    std::vector<TdoaMeas> dropAnchorMeasurements(
+        const std::vector<TdoaMeas> &meas,
+        int anchor_id) const
+    {
+      std::vector<TdoaMeas> kept;
+      kept.reserve(meas.size());
+      for (const auto &m : meas)
+      {
+        if (m.idA == anchor_id || m.idB == anchor_id)
+          continue;
+        kept.push_back(m);
+      }
+      return kept;
+    }
+
+    int incidentMeasurementCount(const std::vector<TdoaMeas> &meas,
+                                 int anchor_id) const
+    {
+      int count = 0;
+      for (const auto &m : meas)
+      {
+        if (m.idA == anchor_id || m.idB == anchor_id)
+          ++count;
+      }
+      return count;
+    }
+
+    bool solveDynamicWls(const std::vector<TdoaMeas> &meas,
+                         const Eigen::Vector3d &seed,
+                         Eigen::Vector3d &wls_p,
+                         Eigen::VectorXd &sigmas)
+    {
+      wls_p = seed;
+      bool ok = wls_solver_.solve(meas, anchors_, wls_p);
+      if (!ok)
+      {
+        sigmas = Eigen::VectorXd();
+        return false;
+      }
+
+      sigmas = computeDynamicTdoaSigmas(meas, wls_p);
+      if (wls_refine_with_dynamic_sigma_ &&
+          sigmas.size() == static_cast<int>(meas.size()))
+      {
+        Eigen::Vector3d weighted_wls_p = wls_p;
+        if (wls_solver_.solveWeighted(meas, anchors_, sigmas, weighted_wls_p))
+        {
+          wls_p = weighted_wls_p;
+          sigmas = computeDynamicTdoaSigmas(meas, wls_p);
+        }
+      }
+      return true;
+    }
+
+    double integrityScore(const IntegrityResult &r) const
+    {
+      const double h_ratio =
+          std::isfinite(r.hpl) && tc_integrity_monitor_.hal > 1e-9
+              ? r.hpl / tc_integrity_monitor_.hal
+              : 10.0;
+      const double v_ratio =
+          std::isfinite(r.vpl) && tc_integrity_monitor_.val > 1e-9
+              ? r.vpl / tc_integrity_monitor_.val
+              : 10.0;
+      const double chi_ratio =
+          (r.chi2_threshold > 1e-9)
+              ? r.chi2_stat / r.chi2_threshold
+              : 10.0;
+      return std::max(std::max(h_ratio, v_ratio), chi_ratio);
+    }
+
+    bool cleanCandidateImproves(const IntegrityResult &all_result,
+                                const IntegrityResult &candidate_result) const
+    {
+      if (candidate_result.available && !all_result.available)
+        return true;
+
+      const double all_score = integrityScore(all_result);
+      const double candidate_score = integrityScore(candidate_result);
+      if (candidate_score < all_score * tc_nlos_anchor_hpl_improvement_ratio_)
+        return true;
+
+      if (all_result.chi2_stat > 1e-9 &&
+          candidate_result.chi2_stat <
+              all_result.chi2_stat * tc_nlos_anchor_chi2_improvement_ratio_)
+        return true;
+
+      return false;
+    }
+
+    CleanLosSelection selectCleanLosMeasurements(
+        double t_mid,
+        const std::vector<TdoaMeas> &meas,
+        bool all_wls_ok,
+        const Eigen::Vector3d &all_wls_p,
+        const Eigen::VectorXd &all_sigmas)
+    {
+      CleanLosSelection out;
+      out.meas = meas;
+      out.sigmas = all_sigmas;
+      out.wls_p = all_wls_p;
+      out.wls_ok = all_wls_ok;
+
+      if (!tc_nlos_anchor_rejection_enabled_ || !all_wls_ok ||
+          static_cast<int>(meas.size()) < tc_nlos_anchor_min_remaining_measurements_)
+      {
+        return out;
+      }
+
+      out.all_result =
+          tc_integrity_monitor_.check(meas, anchors_, all_wls_p, all_sigmas);
+      if (out.all_result.available &&
+          !out.all_result.fault_detected &&
+          out.all_result.ring_ok)
+      {
+        return out;
+      }
+
+      double best_score = integrityScore(out.all_result);
+      int best_anchor = -1;
+      std::vector<TdoaMeas> best_meas;
+      Eigen::VectorXd best_sigmas;
+      Eigen::Vector3d best_wls_p = all_wls_p;
+      IntegrityResult best_result;
+
+      for (int anchor_id = 0; anchor_id < static_cast<int>(anchors_.size()); ++anchor_id)
+      {
+        const int incident = incidentMeasurementCount(meas, anchor_id);
+        if (incident < tc_nlos_anchor_min_incident_measurements_)
+          continue;
+
+        std::vector<TdoaMeas> candidate_meas =
+            dropAnchorMeasurements(meas, anchor_id);
+        if (static_cast<int>(candidate_meas.size()) <
+            tc_nlos_anchor_min_remaining_measurements_)
+          continue;
+
+        Eigen::Vector3d candidate_wls_p;
+        Eigen::VectorXd candidate_sigmas;
+        if (!solveDynamicWls(candidate_meas, all_wls_p,
+                             candidate_wls_p, candidate_sigmas))
+          continue;
+
+        if ((candidate_wls_p - all_wls_p).norm() > tc_nlos_anchor_max_clean_wls_shift_)
+          continue;
+
+        IntegrityResult candidate_result =
+            tc_integrity_monitor_.check(candidate_meas, anchors_,
+                                        candidate_wls_p, candidate_sigmas);
+        if (!cleanCandidateImproves(out.all_result, candidate_result))
+          continue;
+
+        const double candidate_score = integrityScore(candidate_result);
+        if (candidate_score < best_score ||
+            (candidate_result.available && !best_result.available))
+        {
+          best_score = candidate_score;
+          best_anchor = anchor_id;
+          best_meas = std::move(candidate_meas);
+          best_sigmas = candidate_sigmas;
+          best_wls_p = candidate_wls_p;
+          best_result = candidate_result;
+        }
+      }
+
+      if (best_anchor >= 0)
+      {
+        out.meas = std::move(best_meas);
+        out.sigmas = best_sigmas;
+        out.wls_p = best_wls_p;
+        out.wls_ok = true;
+        out.used_clean = true;
+        out.nlos_anchor_id = best_anchor;
+        out.excluded_anchors.push_back(anchorName(best_anchor));
+        out.clean_result = best_result;
+        ROS_WARN_THROTTLE(
+            0.5,
+            "[TC-NLOS] t=%.3f anchor %d removed: meas %zu→%zu, score %.2f→%.2f, HPL/VPL %.3f/%.3f→%.3f/%.3f",
+            t_mid, best_anchor, meas.size(), out.meas.size(),
+            integrityScore(out.all_result), best_score,
+            out.all_result.hpl, out.all_result.vpl,
+            out.clean_result.hpl, out.clean_result.vpl);
+      }
+
+      return out;
+    }
+
     // ===========================================================================
     // PROCESS CYCLE
     // ===========================================================================
@@ -1119,43 +1389,65 @@ namespace uwb_imu_fusion
 
       // WLS
       Eigen::Vector3d wls_p = wls_guess_;
-      bool wls_ok = wls_solver_.solve(meas, anchors_, wls_p);
       Eigen::VectorXd tdoa_sigmas;
-      if (wls_ok)
-      {
-        tdoa_sigmas = computeDynamicTdoaSigmas(meas, wls_p);
-        if (wls_refine_with_dynamic_sigma_ && tdoa_sigmas.size() == static_cast<int>(meas.size()))
-        {
-          Eigen::Vector3d weighted_wls_p = wls_p;
-          if (wls_solver_.solveWeighted(meas, anchors_, tdoa_sigmas, weighted_wls_p))
-          {
-            wls_p = weighted_wls_p;
-            tdoa_sigmas = computeDynamicTdoaSigmas(meas, wls_p);
-          }
-        }
-      }
+      bool wls_ok = solveDynamicWls(meas, wls_guess_, wls_p, tdoa_sigmas);
       if (wls_ok)
         wls_guess_ = wls_p;
       ROS_WARN("[WLS Solution] t=%.3f  x=%.3f  y=%.3f  z=%.3f",
                t_mid, wls_p.x(), wls_p.y(), wls_p.z());
 
-      // ── TC: raw TDOA + IMU ─────────────────────────────────────────────────
-      const std::vector<TdoaMeas> tc_meas = selectTcTdoaMeasurements(meas, wls_ok, wls_p);
-      const Eigen::VectorXd tc_tdoa_sigmas = wls_ok ? computeDynamicTdoaSigmas(tc_meas, wls_p)
-                                                    : Eigen::VectorXd();
+      // ── Clean LOS subset: all-anchor WLS is logged, clean WLS drives TC ─────
+      const CleanLosSelection clean =
+          selectCleanLosMeasurements(t_mid, meas, wls_ok, wls_p, tdoa_sigmas);
+      const bool clean_wls_ok = clean.wls_ok;
+      const Eigen::Vector3d clean_wls_p = clean.wls_p;
+
+      if (clean.used_clean)
+      {
+        wls_guess_ = clean_wls_p;
+        ROS_WARN_THROTTLE(
+            0.5,
+            "[WLS Clean LOS] t=%.3f  all=[%.3f,%.3f,%.3f] clean=[%.3f,%.3f,%.3f] removed_anchor=%d",
+            t_mid, wls_p.x(), wls_p.y(), wls_p.z(),
+            clean_wls_p.x(), clean_wls_p.y(), clean_wls_p.z(),
+            clean.nlos_anchor_id);
+      }
+
+      // ── TC: clean LOS TDOA + IMU ───────────────────────────────────────────
+      const std::vector<TdoaMeas> tc_meas =
+          selectTcTdoaMeasurements(clean.meas, clean_wls_ok, clean_wls_p);
+      const Eigen::VectorXd tc_tdoa_sigmas =
+          clean_wls_ok ? computeDynamicTdoaSigmas(tc_meas, clean_wls_p)
+                       : Eigen::VectorXd();
       const TcIntegritySelection tc_integrity =
-          applyTcIntegrityMonitoring(t_mid, tc_meas, tc_tdoa_sigmas, wls_ok, wls_p);
+          applyTcIntegrityMonitoring(t_mid, tc_meas, tc_tdoa_sigmas,
+                                     clean_wls_ok, clean_wls_p);
       latest_tc_integrity_std_resid_ = tc_integrity.std_resid;
       latest_tc_integrity_labels_ = tc_integrity.labels;
-      const Eigen::Vector3d tc_wls_p = tcCorrectedWlsPosition(wls_p);
+      const Eigen::Vector3d tc_wls_p = tcCorrectedWlsPosition(clean_wls_p);
+      const bool tc_wls_ok =
+          clean_wls_ok &&
+          (!tc_integrity_gate_wls_on_unavailable_ ||
+           !tc_integrity.used_monitor ||
+           tc_integrity.result.available);
+
+      if (clean_wls_ok && !tc_wls_ok)
+      {
+        ROS_WARN_THROTTLE(
+            0.5,
+            "[TC-Integrity] gating WLS-derived TC priors: available=%s HPL=%.3f VPL=%.3f input=%d factors=%zu",
+            tc_integrity.result.available ? "true" : "false",
+            tc_integrity.result.hpl, tc_integrity.result.vpl,
+            tc_integrity.input_count, tc_integrity.meas.size());
+      }
 
       if (!tc_.initialized)
       {
-        tcInitGraph(t_mid, tc_integrity.meas, tc_integrity.sigmas, wls_ok, tc_wls_p);
+        tcInitGraph(t_mid, tc_integrity.meas, tc_integrity.sigmas, tc_wls_ok, tc_wls_p);
       }
       else
       {
-        tcUpdateGraph(t_mid, tc_integrity.meas, tc_integrity.sigmas, wls_ok, tc_wls_p);
+        tcUpdateGraph(t_mid, tc_integrity.meas, tc_integrity.sigmas, tc_wls_ok, tc_wls_p);
       }
       rememberWlsSample(t_mid, wls_ok, wls_p);
 
@@ -1183,7 +1475,9 @@ namespace uwb_imu_fusion
         broadcastTf(stamp, tp, tc_.pose.rotation(), base_frame_ + "_tc");
       }
 
-      logRow(t_mid, wls_ok, wls_p, imu_stats, tc_integrity);
+      logRow(t_mid, wls_ok, wls_p,
+             clean_wls_ok, clean_wls_p,
+             imu_stats, clean, tc_integrity);
     }
 
     // ===========================================================================
@@ -2095,7 +2389,15 @@ namespace uwb_imu_fusion
     double tc_integrity_sigma_inflation_{4.0};
     double tc_integrity_std_resid_soft_gate_{2.5};
     double tc_integrity_std_resid_hard_gate_{5.0};
+    bool tc_integrity_gate_wls_on_unavailable_{true};
+    double tc_integrity_unavailable_sigma_scale_{3.0};
     int tc_integrity_min_factors_{4};
+    bool tc_nlos_anchor_rejection_enabled_{true};
+    int tc_nlos_anchor_min_incident_measurements_{2};
+    int tc_nlos_anchor_min_remaining_measurements_{5};
+    double tc_nlos_anchor_hpl_improvement_ratio_{0.85};
+    double tc_nlos_anchor_chi2_improvement_ratio_{0.80};
+    double tc_nlos_anchor_max_clean_wls_shift_{2.0};
     TdoaIntegrityMonitor tc_integrity_monitor_;
     std::vector<double> latest_tc_integrity_std_resid_;
     std::vector<std::string> latest_tc_integrity_labels_;

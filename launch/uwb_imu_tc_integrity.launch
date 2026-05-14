@@ -182,7 +182,19 @@
     <arg name="tc_integrity_sigma_inflation"     default="4.0" />
     <arg name="tc_integrity_std_resid_soft_gate" default="2.5" />
     <arg name="tc_integrity_std_resid_hard_gate" default="5.0" />
+    <!-- NLOS robustness: when RAIM protection levels exceed HAL/VAL, keep the
+         TDOA factors but soften them and stop using WLS-derived TC priors. -->
+    <arg name="tc_integrity_gate_wls_on_unavailable" default="true" />
+    <arg name="tc_integrity_unavailable_sigma_scale" default="3.0" />
     <arg name="tc_integrity_min_factors"         default="4" />
+    <!-- Anchor-level NLOS handling: test leave-one-anchor-out subsets and feed
+         TC/integrity from the clean LOS subset when it improves PL/chi2. -->
+    <arg name="tc_nlos_anchor_rejection_enabled" default="true" />
+    <arg name="tc_nlos_anchor_min_incident_measurements" default="2" />
+    <arg name="tc_nlos_anchor_min_remaining_measurements" default="5" />
+    <arg name="tc_nlos_anchor_hpl_improvement_ratio" default="0.85" />
+    <arg name="tc_nlos_anchor_chi2_improvement_ratio" default="0.80" />
+    <arg name="tc_nlos_anchor_max_clean_wls_shift" default="2.0" />
 
     <!-- Cycle handling: process short-but-valid cycles instead of waiting for all
          8 pairs. This preserves TC update rate when one or two UWB pairs drop. -->
@@ -279,7 +291,15 @@
         <param name="tc_integrity_sigma_inflation"     value="$(arg tc_integrity_sigma_inflation)"     />
         <param name="tc_integrity_std_resid_soft_gate" value="$(arg tc_integrity_std_resid_soft_gate)" />
         <param name="tc_integrity_std_resid_hard_gate" value="$(arg tc_integrity_std_resid_hard_gate)" />
+        <param name="tc_integrity_gate_wls_on_unavailable" value="$(arg tc_integrity_gate_wls_on_unavailable)" />
+        <param name="tc_integrity_unavailable_sigma_scale" value="$(arg tc_integrity_unavailable_sigma_scale)" />
         <param name="tc_integrity_min_factors"         value="$(arg tc_integrity_min_factors)"         />
+        <param name="tc_nlos_anchor_rejection_enabled" value="$(arg tc_nlos_anchor_rejection_enabled)" />
+        <param name="tc_nlos_anchor_min_incident_measurements" value="$(arg tc_nlos_anchor_min_incident_measurements)" />
+        <param name="tc_nlos_anchor_min_remaining_measurements" value="$(arg tc_nlos_anchor_min_remaining_measurements)" />
+        <param name="tc_nlos_anchor_hpl_improvement_ratio" value="$(arg tc_nlos_anchor_hpl_improvement_ratio)" />
+        <param name="tc_nlos_anchor_chi2_improvement_ratio" value="$(arg tc_nlos_anchor_chi2_improvement_ratio)" />
+        <param name="tc_nlos_anchor_max_clean_wls_shift" value="$(arg tc_nlos_anchor_max_clean_wls_shift)" />
         <param name="min_cycle_measurements"    value="$(arg min_cycle_measurements)"    />
 
     </node>
