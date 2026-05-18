@@ -1,6 +1,6 @@
 // =============================================================================
-// uwb_imu_tc_integrity_node.cpp  —  Tightly Coupled UWB + IMU fusion
-//                                  with integrity-shaped UWB factors
+// uwb_tdoa_imu_tc_integrity_node.cpp  —  Dataset-specialized tightly coupled
+//                                        UWB TDOA + IMU fusion with integrity
 //
 // PIPELINE
 // ─────────────────────────────────────────────────────────────────────────────
@@ -85,6 +85,7 @@
 #include <iomanip>
 #include <limits>
 #include <mutex>
+#include <map>
 #include <set>
 #include <sstream>
 #include <utility>
@@ -116,6 +117,8 @@ namespace uwb_imu_fusion
     double t;
     gtsam::Point3 p;
   };
+
+  using TdoaMeasurements = std::vector<TdoaMeas>;
 
   struct FgoState
   {
@@ -264,11 +267,11 @@ namespace uwb_imu_fusion
       //                                      must converge from zero
       //   tc_gyro_bias_rw_sigma  0.0003      gyro bias is small and stable
       // ---------------------------------------------------------------------------
-      get("tc_accel_noise_sigma", tc_accel_sigma_, 0.08);             // lower IMU weight than measured floor
-      get("tc_gyro_noise_sigma", tc_gyro_sigma_, 0.006);              // lower IMU attitude authority
+      get("tc_accel_noise_sigma", tc_accel_sigma_, 0.05);             // const4 CSV static accel floor
+      get("tc_gyro_noise_sigma", tc_gyro_sigma_, 0.01);               // const4 CSV gyro is noisy during motion
       get("tc_accel_bias_rw_sigma", tc_accel_bias_rw_sigma_, 0.02);   // allow accel bias to absorb IMU mismatch
       get("tc_gyro_bias_rw_sigma", tc_gyro_bias_rw_sigma_, 0.0006);   // allow gyro bias to adapt
-      get("tc_integration_noise_sigma", tc_integration_sigma_, 5e-4); // lower long-window IMU confidence
+      get("tc_integration_noise_sigma", tc_integration_sigma_, 1e-2); // CSV-tuned: avoid overconfident preintegration
 
       // ---------------------------------------------------------------------------
       // UWB / TC measurement noise
@@ -285,24 +288,29 @@ namespace uwb_imu_fusion
       //   XY = 0.25 m (confident), Z = 0.35 m (WLS Z noisier due to poor
       //   vertical anchor geometry → slightly looser to avoid vertical lock).
       // ---------------------------------------------------------------------------
-      get("tdoa_sigma", tdoa_sigma_, 0.2); // higher UWB weight; residual gate handles large NLOS spikes
+      get("tdoa_sigma", tdoa_sigma_, 0.35); // const4 CSV: keep UWB strong, leave room for multipath
       get("use_robust_noise", use_robust_noise_, true);
       get("huber_k", huber_k_, 1.345);
       get("use_dynamic_tdoa_sigma", use_dynamic_tdoa_sigma_, true);
       get("tdoa_sigma_min", tdoa_sigma_min_, 0.05);
-      get("tdoa_sigma_max", tdoa_sigma_max_, 0.8);
+      get("tdoa_sigma_max", tdoa_sigma_max_, 1.2);
       get("tdoa_residual_sigma_scale", tdoa_residual_sigma_scale_, 0.75);
       get("wls_refine_with_dynamic_sigma", wls_refine_with_dynamic_sigma_, true);
-      get("cycle_timeout", cycle_timeout_, 0.1);
-      int mpc = 8, min_cycle = 6, min_imu = 2;
+      get("cycle_timeout", cycle_timeout_, 0.06);
+      int mpc = 8, min_cycle = 6, min_imu = 1;
       get("measurements_per_cycle", mpc, 8);
       get("min_cycle_measurements", min_cycle, 6);
-      get("min_imu_per_cycle", min_imu, 2);
+      get("min_imu_per_cycle", min_imu, 1);
+      get("close_epoch_on_count", close_epoch_on_count_, false);
+      get("max_epoch_measurements", max_epoch_measurements_, 24);
+      get("compress_epoch_pairs", compress_epoch_pairs_, false);
       measurements_per_cycle_ = mpc;
       min_cycle_measurements_ = std::min(std::max(min_cycle, 3), measurements_per_cycle_);
       min_imu_per_cycle_ = min_imu;
+      max_epoch_measurements_ =
+          std::max(max_epoch_measurements_, min_cycle_measurements_);
       get("tc_use_tdoa_residual_gate", tc_use_tdoa_residual_gate_, true);
-      get("tc_tdoa_residual_gate", tc_tdoa_residual_gate_, 0.9);
+      get("tc_tdoa_residual_gate", tc_tdoa_residual_gate_, 1.2);
       get("tc_min_tdoa_factors", tc_min_tdoa_factors_, 4);
       tc_min_tdoa_factors_ = std::min(std::max(tc_min_tdoa_factors_, 3), measurements_per_cycle_);
 
@@ -371,12 +379,19 @@ namespace uwb_imu_fusion
       get("tc_wls_velocity_sigma", tc_wls_velocity_sigma_, 0.15);
       get("tc_wls_velocity_max_speed", tc_wls_velocity_max_speed_, 1.2);
       get("tc_wls_velocity_max_dt", tc_wls_velocity_max_dt_, 0.25);
+      get("tc_use_wls_z_velocity_prior", tc_use_wls_z_velocity_prior_, true);
+      get("tc_wls_z_velocity_sigma", tc_wls_z_velocity_sigma_, 0.25);
+      get("tc_wls_z_velocity_max_speed", tc_wls_z_velocity_max_speed_, 0.8);
       get("tc_use_vertical_prior", tc_use_vertical_prior_, true);
       get("tc_vertical_prior_sigma", tc_vertical_prior_sigma_, 0.15);
       get("tc_vertical_prior_source", tc_vertical_prior_source_, std::string("wls"));
       get("tc_vertical_prior_z_ref", tc_vertical_prior_z_ref_,
           std::numeric_limits<double>::quiet_NaN());
       get("tc_wls_z_bias_correction", tc_wls_z_bias_correction_, 0.0);
+      get("tc_wls_z_filter_enabled", tc_wls_z_filter_enabled_, false);
+      get("tc_wls_z_filter_alpha", tc_wls_z_filter_alpha_, 0.65);
+      get("tc_wls_z_filter_outlier_gate", tc_wls_z_filter_outlier_gate_, 0.45);
+      get("tc_wls_z_filter_outlier_alpha", tc_wls_z_filter_outlier_alpha_, 0.20);
 
       // WLS position prior sigmas
       //   XY: 0.25 m — WLS proven accurate in horizontal plane
@@ -567,7 +582,7 @@ namespace uwb_imu_fusion
 
     struct TcIntegritySelection
     {
-      std::vector<TdoaMeas> meas;
+      TdoaMeasurements meas;
       Eigen::VectorXd sigmas;
       std::vector<double> std_resid;
       std::vector<std::string> labels;
@@ -583,7 +598,7 @@ namespace uwb_imu_fusion
 
     struct CleanLosSelection
     {
-      std::vector<TdoaMeas> meas;
+      TdoaMeasurements meas;
       Eigen::VectorXd sigmas;
       Eigen::Vector3d wls_p{0, 0, 0};
       bool wls_ok{false};
@@ -923,7 +938,14 @@ namespace uwb_imu_fusion
     }
 
     // ===========================================================================
-    // UWB CALLBACK — cycle accumulator (validated, unchanged)
+    // UWB CALLBACK — const4 CSV/rosbag-specialized cycle accumulator
+    //
+    // The const4 CSV stream can contain reciprocal or repeated unordered pairs
+    // within the same physical epoch, e.g. 4-0 followed by 0-4.  The generic
+    // node treats an unordered-pair repeat as a cycle boundary; that is useful
+    // for some live UWB schedules, but it prematurely splits this rosbag.  This
+    // specialized node forms epochs by timestamp window by default.  A count
+    // close can be re-enabled by parameter for old structured sequences.
     // ===========================================================================
     void uwbCallback(const cf_msgs::Tdoa::ConstPtr &msg)
     {
@@ -942,30 +964,22 @@ namespace uwb_imu_fusion
       {
         processCurrentCycleIfReady();
         current_cycle_.clear();
-        cycle_pairs_.clear();
-      }
-      auto pr = std::make_pair(std::min(ts.idA, ts.idB), std::max(ts.idA, ts.idB));
-      if (cycle_pairs_.count(pr))
-      {
-        processCurrentCycleIfReady();
-        current_cycle_.clear();
-        cycle_pairs_.clear();
-      }
+              }
       current_cycle_.push_back(ts);
-      cycle_pairs_.insert(pr);
-      if ((int)current_cycle_.size() >= measurements_per_cycle_)
+      if ((close_epoch_on_count_ &&
+           (int)current_cycle_.size() >= measurements_per_cycle_) ||
+          (int)current_cycle_.size() >= max_epoch_measurements_)
       {
-        processCycle(current_cycle_);
+        processUnstructuredEpoch(current_cycle_);
         current_cycle_.clear();
-        cycle_pairs_.clear();
-      }
+              }
     }
 
     void processCurrentCycleIfReady()
     {
       if ((int)current_cycle_.size() >= min_cycle_measurements_)
       {
-        processCycle(current_cycle_);
+        processUnstructuredEpoch(current_cycle_);
       }
       else if (!current_cycle_.empty())
       {
@@ -973,6 +987,73 @@ namespace uwb_imu_fusion
                           "[uwb_imu_fusion] Dropping short UWB cycle: %zu measurements < min=%d",
                           current_cycle_.size(), min_cycle_measurements_);
       }
+    }
+
+    TdoaMeasurements compressEpochPairs(
+        const TdoaMeasurements &meas) const
+    {
+      struct Accum
+      {
+        double t_sum{0.0};
+        double tdoa_sum{0.0};
+        int count{0};
+        int idA{-1};
+        int idB{-1};
+      };
+
+      std::map<std::pair<int, int>, Accum> acc;
+      for (const auto &m : meas)
+      {
+        const int a = std::min(m.idA, m.idB);
+        const int b = std::max(m.idA, m.idB);
+        const double canonical_tdoa = (m.idA == a && m.idB == b)
+                                          ? m.tdoa
+                                          : -m.tdoa;
+        auto &slot = acc[std::make_pair(a, b)];
+        slot.t_sum += m.t;
+        slot.tdoa_sum += canonical_tdoa;
+        ++slot.count;
+        slot.idA = a;
+        slot.idB = b;
+      }
+
+      TdoaMeasurements out;
+      out.reserve(acc.size());
+      for (const auto &kv : acc)
+      {
+        const auto &slot = kv.second;
+        if (slot.count <= 0)
+          continue;
+        out.push_back(TdoaMeas{
+            slot.t_sum / static_cast<double>(slot.count),
+            slot.idA,
+            slot.idB,
+            slot.tdoa_sum / static_cast<double>(slot.count)});
+      }
+      return out;
+    }
+
+    void processUnstructuredEpoch(const TdoaMeasurements &raw_meas)
+    {
+      if (!compress_epoch_pairs_)
+      {
+        processCycle(raw_meas);
+        return;
+      }
+
+      const TdoaMeasurements compressed = compressEpochPairs(raw_meas);
+      if (static_cast<int>(compressed.size()) < min_cycle_measurements_)
+      {
+        ROS_WARN_THROTTLE(
+            1.0,
+            "[uwb_tdoa_imu_tc_integrity] Dropping compressed UWB epoch: raw=%zu unique_pairs=%zu < min=%d",
+            raw_meas.size(), compressed.size(), min_cycle_measurements_);
+        return;
+      }
+
+      ROS_DEBUG("[uwb_tdoa_imu_tc_integrity] compressed epoch raw=%zu unique_pairs=%zu",
+                raw_meas.size(), compressed.size());
+      processCycle(compressed);
     }
 
     // ===========================================================================
@@ -1059,7 +1140,7 @@ namespace uwb_imu_fusion
 
     TcIntegritySelection applyTcIntegrityMonitoring(
         double t_mid,
-        const std::vector<TdoaMeas> &meas,
+        const TdoaMeasurements &meas,
         const Eigen::VectorXd &base_sigmas,
         bool wls_ok,
         const Eigen::Vector3d &wls_p) const
@@ -1073,14 +1154,11 @@ namespace uwb_imu_fusion
       out.input_pairs.reserve(meas.size());
       out.factor_pairs.reserve(meas.size());
       out.factor_sigmas.reserve(meas.size());
-      auto pairName = [](const TdoaMeas &m)
-      {
-        return std::to_string(m.idA) + "-" + std::to_string(m.idB);
-      };
       for (size_t i = 0; i < meas.size(); ++i)
       {
-        out.input_pairs.push_back(pairName(meas[i]));
-        out.factor_pairs.push_back(pairName(meas[i]));
+        const std::string pair_name = toPairString(meas[i].idA, meas[i].idB);
+        out.input_pairs.push_back(pair_name);
+        out.factor_pairs.push_back(pair_name);
         out.factor_sigmas.push_back(
             base_sigmas.size() == static_cast<int>(meas.size())
                 ? base_sigmas(static_cast<int>(i))
@@ -1170,7 +1248,7 @@ namespace uwb_imu_fusion
 
       if (!drop.empty())
       {
-        std::vector<TdoaMeas> filtered;
+        TdoaMeasurements filtered;
         filtered.reserve(meas.size() - drop.size());
         Eigen::VectorXd filtered_sigmas(static_cast<int>(meas.size() - drop.size()));
         std::vector<double> filtered_std;
@@ -1184,8 +1262,8 @@ namespace uwb_imu_fusion
           if (drop.count(i))
           {
             if (out.excluded_count++ > 0) dropped << ";";
-            dropped << meas[i].idA << "-" << meas[i].idB;
-            out.excluded_pairs.push_back(pairName(meas[i]));
+            dropped << toPairString(meas[i].idA, meas[i].idB);
+            out.excluded_pairs.push_back(toPairString(meas[i].idA, meas[i].idB));
             continue;
           }
           filtered.push_back(meas[i]);
@@ -1195,7 +1273,7 @@ namespace uwb_imu_fusion
                   : tdoa_sigma_;
           filtered_std.push_back(out.std_resid[i]);
           filtered_labels.push_back(out.labels[i]);
-          filtered_pairs.push_back(pairName(meas[i]));
+          filtered_pairs.push_back(toPairString(meas[i].idA, meas[i].idB));
           filtered_factor_sigmas.push_back(filtered_sigmas(row - 1));
         }
         out.meas = std::move(filtered);
@@ -1218,11 +1296,16 @@ namespace uwb_imu_fusion
       return std::to_string(id);
     }
 
-    std::vector<TdoaMeas> dropAnchorMeasurements(
-        const std::vector<TdoaMeas> &meas,
+    static std::string toPairString(int id_a, int id_b)
+    {
+      return std::to_string(id_a) + "-" + std::to_string(id_b);
+    }
+
+    TdoaMeasurements dropAnchorMeasurements(
+        const TdoaMeasurements &meas,
         int anchor_id) const
     {
-      std::vector<TdoaMeas> kept;
+      TdoaMeasurements kept;
       kept.reserve(meas.size());
       for (const auto &m : meas)
       {
@@ -1233,7 +1316,7 @@ namespace uwb_imu_fusion
       return kept;
     }
 
-    int incidentMeasurementCount(const std::vector<TdoaMeas> &meas,
+    int incidentMeasurementCount(const TdoaMeasurements &meas,
                                  int anchor_id) const
     {
       int count = 0;
@@ -1245,7 +1328,7 @@ namespace uwb_imu_fusion
       return count;
     }
 
-    bool solveDynamicWls(const std::vector<TdoaMeas> &meas,
+    bool solveDynamicWls(const TdoaMeasurements &meas,
                          const Eigen::Vector3d &seed,
                          Eigen::Vector3d &wls_p,
                          Eigen::VectorXd &sigmas)
@@ -1310,7 +1393,7 @@ namespace uwb_imu_fusion
 
     CleanLosSelection selectCleanLosMeasurements(
         double t_mid,
-        const std::vector<TdoaMeas> &meas,
+        const TdoaMeasurements &meas,
         bool all_wls_ok,
         const Eigen::Vector3d &all_wls_p,
         const Eigen::VectorXd &all_sigmas)
@@ -1339,7 +1422,7 @@ namespace uwb_imu_fusion
 
       double best_score = integrityScore(out.all_result);
       int best_anchor = -1;
-      std::vector<TdoaMeas> best_meas;
+      TdoaMeasurements best_meas;
       Eigen::VectorXd best_sigmas;
       Eigen::Vector3d best_wls_p = all_wls_p;
       IntegrityResult best_result;
@@ -1350,7 +1433,7 @@ namespace uwb_imu_fusion
         if (incident < tc_nlos_anchor_min_incident_measurements_)
           continue;
 
-        std::vector<TdoaMeas> candidate_meas =
+        TdoaMeasurements candidate_meas =
             dropAnchorMeasurements(meas, anchor_id);
         if (static_cast<int>(candidate_meas.size()) <
             tc_nlos_anchor_min_remaining_measurements_)
@@ -1412,7 +1495,7 @@ namespace uwb_imu_fusion
     // ===========================================================================
     // PROCESS CYCLE
     // ===========================================================================
-    void processCycle(const std::vector<TdoaMeas> &meas)
+    void processCycle(const TdoaMeasurements &meas)
     {
       double t_mid = 0.0;
       for (const auto &m : meas)
@@ -1452,7 +1535,7 @@ namespace uwb_imu_fusion
       }
 
       // ── TC: clean LOS TDOA + IMU ───────────────────────────────────────────
-      const std::vector<TdoaMeas> tc_meas =
+      const TdoaMeasurements tc_meas =
           selectTcTdoaMeasurements(clean.meas, clean_wls_ok, clean_wls_p);
       const Eigen::VectorXd tc_tdoa_sigmas =
           clean_wls_ok ? computeDynamicTdoaSigmas(tc_meas, clean_wls_p)
@@ -1462,7 +1545,8 @@ namespace uwb_imu_fusion
                                      clean_wls_ok, clean_wls_p);
       latest_tc_integrity_std_resid_ = tc_integrity.std_resid;
       latest_tc_integrity_labels_ = tc_integrity.labels;
-      const Eigen::Vector3d tc_wls_p = tcCorrectedWlsPosition(clean_wls_p);
+      const Eigen::Vector3d tc_wls_p =
+          filterTcWlsPositionForTc(t_mid, tcCorrectedWlsPosition(clean_wls_p));
       const bool tc_wls_ok =
           clean_wls_ok &&
           (!tc_integrity_gate_wls_on_unavailable_ ||
@@ -1647,6 +1731,40 @@ namespace uwb_imu_fusion
       return corrected;
     }
 
+    Eigen::Vector3d filterTcWlsPositionForTc(double t,
+                                             const Eigen::Vector3d &wls_p)
+    {
+      if (!tc_wls_z_filter_enabled_ || !std::isfinite(wls_p.z()))
+        return wls_p;
+
+      Eigen::Vector3d filtered = wls_p;
+      if (!have_tc_wls_z_filter_)
+      {
+        tc_wls_z_filter_z_ = wls_p.z();
+        tc_wls_z_filter_t_ = t;
+        have_tc_wls_z_filter_ = true;
+        return filtered;
+      }
+
+      const double dz = wls_p.z() - tc_wls_z_filter_z_;
+      const bool outlier = std::fabs(dz) > tc_wls_z_filter_outlier_gate_;
+      const double alpha = std::min(
+          1.0, std::max(0.0, outlier ? tc_wls_z_filter_outlier_alpha_
+                                      : tc_wls_z_filter_alpha_));
+      tc_wls_z_filter_z_ += alpha * dz;
+      tc_wls_z_filter_t_ = t;
+      filtered.z() = tc_wls_z_filter_z_;
+
+      if (outlier)
+      {
+        ROS_WARN_THROTTLE(
+            0.5,
+            "[TC-WLS-Z] smoothing vertical WLS prior: raw_z=%.3f filtered_z=%.3f dz=%.3f alpha=%.2f",
+            wls_p.z(), filtered.z(), dz, alpha);
+      }
+      return filtered;
+    }
+
     void addTcAttitudePrior(gtsam::NonlinearFactorGraph &graph,
                             size_t k,
                             const gtsam::Point3 &pos_hint)
@@ -1769,7 +1887,15 @@ namespace uwb_imu_fusion
         return false;
 
       Eigen::Vector3d v = (wls_p - last_wls_p_) / dt;
-      v.z() = 0.0; // WLS Z finite differences are too noisy for velocity priors.
+      if (tc_use_wls_z_velocity_prior_)
+      {
+        v.z() = std::min(std::max(v.z(), -tc_wls_z_velocity_max_speed_),
+                         tc_wls_z_velocity_max_speed_);
+      }
+      else
+      {
+        v.z() = 0.0;
+      }
       const double speed = v.norm();
       if (speed > tc_wls_velocity_max_speed_)
         v *= tc_wls_velocity_max_speed_ / speed;
@@ -1799,7 +1925,7 @@ namespace uwb_imu_fusion
       return std::min(std::max(sigma, tdoa_sigma_min_), tdoa_sigma_max_);
     }
 
-    Eigen::VectorXd computeDynamicTdoaSigmas(const std::vector<TdoaMeas> &meas,
+    Eigen::VectorXd computeDynamicTdoaSigmas(const TdoaMeasurements &meas,
                                              const Eigen::Vector3d &wls_p) const
     {
       Eigen::VectorXd sigmas(meas.size());
@@ -1826,7 +1952,7 @@ namespace uwb_imu_fusion
 
     void addTcTdoaFactors(gtsam::NonlinearFactorGraph &graph,
                           size_t k,
-                          const std::vector<TdoaMeas> &meas,
+                          const TdoaMeasurements &meas,
                           const Eigen::VectorXd &sigmas) const
     {
       for (size_t i = 0; i < meas.size(); ++i)
@@ -1845,14 +1971,14 @@ namespace uwb_imu_fusion
                 ? latest_tc_integrity_labels_[i]
                 : std::string("nominal");
         graph.add(IntegrityTdoaFactor(X(k), anchors_[m.idA], anchors_[m.idB],
-                                      -m.tdoa, makeTdoaNoise(sigma),
-                                      m.idA, m.idB, sigma, std_resid, label));
+                                     -m.tdoa, makeTdoaNoise(sigma), m.idA,
+                                     m.idB, sigma, std_resid, label));
       }
     }
 
-    std::vector<TdoaMeas> selectTcTdoaMeasurements(const std::vector<TdoaMeas> &meas,
-                                                   bool wls_ok,
-                                                   const Eigen::Vector3d &wls_p) const
+    TdoaMeasurements selectTcTdoaMeasurements(const TdoaMeasurements &meas,
+                                             bool wls_ok,
+                                             const Eigen::Vector3d &wls_p) const
     {
       if (!tc_use_tdoa_residual_gate_ || !wls_ok ||
           tc_tdoa_residual_gate_ <= 0.0 ||
@@ -1861,7 +1987,7 @@ namespace uwb_imu_fusion
         return meas;
       }
 
-      std::vector<TdoaMeas> kept;
+      TdoaMeasurements kept;
       kept.reserve(meas.size());
       double max_abs_residual = 0.0;
       for (const auto &m : meas)
@@ -1902,7 +2028,7 @@ namespace uwb_imu_fusion
     // This prevents the >0.8 m phantom drift observed during 0.6 s IMU dropouts
     // while the vehicle is moving at ~1 m/s.
     // ===========================================================================
-    void tcDropoutUpdate(double t_mid, const std::vector<TdoaMeas> &meas,
+    void tcDropoutUpdate(double t_mid, const TdoaMeasurements &meas,
                          const Eigen::VectorXd &tdoa_sigmas,
                          bool wls_ok, const Eigen::Vector3d &wls_p)
     {
@@ -1939,7 +2065,15 @@ namespace uwb_imu_fusion
         {
           dropout_vel_ref.x() = wls_vel_ref.x();
           dropout_vel_ref.y() = wls_vel_ref.y();
-          dropout_vel_sig.z() = tc_update_vel_sigma_;
+          if (tc_use_wls_z_velocity_prior_)
+          {
+            dropout_vel_ref.z() = wls_vel_ref.z();
+            dropout_vel_sig.z() = tc_wls_z_velocity_sigma_;
+          }
+          else
+          {
+            dropout_vel_sig.z() = tc_update_vel_sigma_;
+          }
         }
       }
       graph.addPrior(V(k), dropout_vel_ref,
@@ -1993,7 +2127,7 @@ namespace uwb_imu_fusion
                         tc_.pose.x(), tc_.pose.y(), tc_.pose.z());
     }
 
-    void tcInitGraph(double t_mid, const std::vector<TdoaMeas> &meas,
+    void tcInitGraph(double t_mid, const TdoaMeasurements &meas,
                      const Eigen::VectorXd &tdoa_sigmas,
                      bool wls_ok, const Eigen::Vector3d &wls_p)
     {
@@ -2056,7 +2190,7 @@ namespace uwb_imu_fusion
     // TC-FGO UPDATE
     // Per keyframe k: ImuFactor + BiasBetween + TdoaFactor × N
     // ===========================================================================
-    void tcUpdateGraph(double t_mid, const std::vector<TdoaMeas> &meas,
+    void tcUpdateGraph(double t_mid, const TdoaMeasurements &meas,
                        const Eigen::VectorXd &tdoa_sigmas,
                        bool wls_ok, const Eigen::Vector3d &wls_p)
     {
@@ -2101,20 +2235,24 @@ namespace uwb_imu_fusion
       {
         vel_prior_mean.x() = wls_vel_ref.x();
         vel_prior_mean.y() = wls_vel_ref.y();
+        if (tc_use_wls_z_velocity_prior_)
+          vel_prior_mean.z() = wls_vel_ref.z();
         vel_prior_sigma = tc_wls_velocity_sigma_;
         using_wls_vel_prior = true;
       }
 
       gtsam::Vector3 vel_prior_sig;
-      vel_prior_sig << vel_prior_sigma, vel_prior_sigma, tc_update_vel_sigma_;
+      vel_prior_sig << vel_prior_sigma, vel_prior_sigma,
+          tc_use_wls_z_velocity_prior_ ? tc_wls_z_velocity_sigma_
+                                       : tc_update_vel_sigma_;
       graph.addPrior(V(k), vel_prior_mean,
                      gtsam::noiseModel::Diagonal::Sigmas(vel_prior_sig));
       if (using_wls_vel_prior)
       {
         ROS_WARN_THROTTLE(0.5,
-                          "[TC-FGO] WLS XY velocity prior active: v_xy=[%.3f,%.3f] sigma_xy=%.3f sigma_z=%.3f",
-                          vel_prior_mean.x(), vel_prior_mean.y(),
-                          vel_prior_sigma, tc_update_vel_sigma_);
+                          "[TC-FGO] WLS velocity prior active: v=[%.3f,%.3f,%.3f] sigma_xy=%.3f sigma_z=%.3f",
+                          vel_prior_mean.x(), vel_prior_mean.y(), vel_prior_mean.z(),
+                          vel_prior_sigma, vel_prior_sig.z());
       }
       graph.addPrior(B(k), tc_.bias,
                      gtsam::noiseModel::Isotropic::Sigma(6, tc_update_bias_sigma_));
@@ -2265,6 +2403,11 @@ namespace uwb_imu_fusion
       }
       ROS_INFO("[uwb_imu_fusion] UWB cycle: min_measurements=%d timeout=%.3f s",
                min_cycle_measurements_, cycle_timeout_);
+      ROS_INFO("[uwb_imu_fusion] specialized epoching: close_on_count=%s count=%d max_epoch_measurements=%d",
+               close_epoch_on_count_ ? "true" : "false",
+               measurements_per_cycle_, max_epoch_measurements_);
+      ROS_INFO("[uwb_imu_fusion] specialized epoch compression: compress_epoch_pairs=%s",
+               compress_epoch_pairs_ ? "true" : "false");
       ROS_INFO("[uwb_imu_fusion] gravity=%.3f  tdoa_sigma=%.3f",
                gravity_mag_, tdoa_sigma_);
       ROS_INFO("[uwb_imu_fusion] dynamic TDOA sigma: %s  min=%.3f max=%.3f residual_scale=%.3f wls_refine=%s",
@@ -2286,6 +2429,9 @@ namespace uwb_imu_fusion
       ROS_INFO("[uwb_imu_fusion] WLS velocity prior: %s  sigma=%.3f max_speed=%.3f max_dt=%.3f",
                tc_use_wls_velocity_prior_ ? "enabled" : "disabled",
                tc_wls_velocity_sigma_, tc_wls_velocity_max_speed_, tc_wls_velocity_max_dt_);
+      ROS_INFO("[uwb_imu_fusion] WLS Z velocity prior: %s  sigma=%.3f max_z_speed=%.3f",
+               tc_use_wls_z_velocity_prior_ ? "enabled" : "disabled",
+               tc_wls_z_velocity_sigma_, tc_wls_z_velocity_max_speed_);
       ROS_INFO("[uwb_imu_fusion] imu leveling: %s  samples=%d",
                estimate_initial_orientation_from_imu_ ? "enabled" : "disabled",
                initial_alignment_imu_samples_);
@@ -2301,6 +2447,10 @@ namespace uwb_imu_fusion
                tc_wls_xy_sigma_, tc_wls_z_sigma_);
       ROS_INFO("[uwb_imu_fusion] tc WLS Z bias correction: %.3f m",
                tc_wls_z_bias_correction_);
+      ROS_INFO("[uwb_imu_fusion] tc WLS Z filter: %s alpha=%.2f outlier_gate=%.3f outlier_alpha=%.2f",
+               tc_wls_z_filter_enabled_ ? "enabled" : "disabled",
+               tc_wls_z_filter_alpha_, tc_wls_z_filter_outlier_gate_,
+               tc_wls_z_filter_outlier_alpha_);
       ROS_INFO("[uwb_imu_fusion] tc WLS rescue: gate=%.3f xy_sigma=%.3f z_sigma=%.3f",
                tc_wls_rescue_gate_, tc_wls_rescue_xy_sigma_, tc_wls_rescue_z_sigma_);
       ROS_INFO("[uwb_imu_fusion] tc TDOA residual gate: %s  gate=%.3f min_factors=%d",
@@ -2372,10 +2522,12 @@ namespace uwb_imu_fusion
     std::vector<gtsam::Point3> anchors_;
     std::string odom_frame_{"map"}, base_frame_{"base_link"};
 
-    std::vector<TdoaMeas> current_cycle_;
-    std::set<std::pair<int, int>> cycle_pairs_;
+    TdoaMeasurements current_cycle_;
     int measurements_per_cycle_{8}, min_cycle_measurements_{6}, min_imu_per_cycle_{2};
+    int max_epoch_measurements_{24};
     double cycle_timeout_{0.1};
+    bool close_epoch_on_count_{false};
+    bool compress_epoch_pairs_{false};
 
     TdoaWlsSolver wls_solver_;
     Eigen::Vector3d wls_guess_{0, 0, 1};
@@ -2450,10 +2602,20 @@ namespace uwb_imu_fusion
     double tc_wls_velocity_sigma_{0.15};    // [m/s] stronger WLS-derived velocity regularizer
     double tc_wls_velocity_max_speed_{1.2}; // [m/s] cap noisy WLS finite differences
     double tc_wls_velocity_max_dt_{0.25};   // [s] reject stale WLS velocity pairs
+    bool tc_use_wls_z_velocity_prior_{true};
+    double tc_wls_z_velocity_sigma_{0.25};
+    double tc_wls_z_velocity_max_speed_{0.8};
     bool tc_use_vertical_prior_{true};
     double tc_vertical_prior_sigma_{0.15};
     std::string tc_vertical_prior_source_{"wls"};
     double tc_vertical_prior_z_ref_{std::numeric_limits<double>::quiet_NaN()};
+    bool tc_wls_z_filter_enabled_{false};
+    double tc_wls_z_filter_alpha_{0.65};
+    double tc_wls_z_filter_outlier_gate_{0.45};
+    double tc_wls_z_filter_outlier_alpha_{0.20};
+    bool have_tc_wls_z_filter_{false};
+    double tc_wls_z_filter_z_{0.0};
+    double tc_wls_z_filter_t_{0.0};
     bool tc_use_wls_position_prior_{true};
     double tc_wls_xy_sigma_{0.15}; // [m] stronger horizontal WLS trust
     double tc_wls_z_sigma_{0.25};  // [m] looser than XY: WLS Z less reliable
@@ -2496,7 +2658,7 @@ namespace uwb_imu_fusion
 
 int main(int argc, char **argv)
 {
-  ros::init(argc, argv, "uwb_imu_tc_integrity_node");
+  ros::init(argc, argv, "uwb_tdoa_imu_tc_integrity_node");
   ros::NodeHandle nh, pnh("~");
   uwb_imu_fusion::UwbImuFusionNode node(nh, pnh);
   ros::AsyncSpinner spinner(2);

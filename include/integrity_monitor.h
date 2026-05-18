@@ -67,6 +67,16 @@ namespace uwb_imu_fusion {
 // =============================================================================
 // IntegrityResult  —  output bundle from one integrity epoch
 // =============================================================================
+struct RingClosureLoop {
+  int a{-1};
+  int b{-1};
+  int c{-1};
+  double ab{0.0};
+  double bc{0.0};
+  double ca{0.0};
+  double error{0.0};
+};
+
 struct IntegrityResult {
   // ── Chi-squared global test ─────────────────────────────────────────────────
   double chi2_stat{0.0};
@@ -82,6 +92,7 @@ struct IntegrityResult {
   double ring_sum{0.0};
   bool   ring_ok{true};
   int    ring_closed_loops{0};
+  std::vector<RingClosureLoop> ring_loops;
 
   // ── Protection levels ───────────────────────────────────────────────────────
   double hpl{std::numeric_limits<double>::quiet_NaN()};
@@ -351,6 +362,7 @@ class TdoaIntegrityMonitor {
     res.ring_sum          = 0.0;
     res.ring_ok           = true;
     res.ring_closed_loops = 0;
+    res.ring_loops.clear();
 
     double worst_abs   = 0.0;
     double worst_signed = 0.0;
@@ -369,6 +381,15 @@ class TdoaIntegrityMonitor {
           const double err     = ab + bc + ca;
           const double abs_err = std::fabs(err);
           ++res.ring_closed_loops;
+          RingClosureLoop loop;
+          loop.a = a;
+          loop.b = b;
+          loop.c = c;
+          loop.ab = ab;
+          loop.bc = bc;
+          loop.ca = ca;
+          loop.error = err;
+          res.ring_loops.push_back(loop);
 
           if (abs_err > worst_abs) {
             worst_abs    = abs_err;
